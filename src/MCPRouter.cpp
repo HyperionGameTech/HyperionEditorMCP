@@ -13,6 +13,7 @@ namespace MCP {
 void RegisterSystemMCPTools(MCPRouter& router);
 void RegisterCommandMCPTools(MCPRouter& router);
 void RegisterReflectionMCPTools(MCPRouter& router);
+void RegisterImportMCPTools(MCPRouter& router);
 
 MCPRouter& MCPRouter::GetInstance()
 {
@@ -26,6 +27,7 @@ MCPRouter& MCPRouter::GetInstance()
         RegisterSystemMCPTools(s_instance);
         RegisterCommandMCPTools(s_instance);
         RegisterReflectionMCPTools(s_instance);
+        RegisterImportMCPTools(s_instance);
     }
 
     return s_instance;

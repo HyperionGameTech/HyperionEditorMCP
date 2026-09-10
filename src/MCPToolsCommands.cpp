@@ -36,7 +36,8 @@ static constexpr UTF8StringView DeniedEditorCommands[] {
     "NewProject",
     "SaveProject",
     "SaveProjectAs",
-    "CloseProject"
+    "CloseProject",
+    "ImportContent"
 };
 
 const Class* FindEditorCommandClass(UTF8StringView name)
