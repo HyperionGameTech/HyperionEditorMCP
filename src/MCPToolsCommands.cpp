@@ -30,14 +30,20 @@ namespace MCP {
 
 namespace {
 
-// these commands show modal windows and should not be allowed to be called from the server
+// these commands can only work through a modal window, so they can't be called from the server
 static constexpr UTF8StringView DeniedEditorCommands[] {
-    "OpenProject",
-    "NewProject",
-    "SaveProject",
-    "SaveProjectAs",
-    "CloseProject",
     "ImportContent"
+};
+
+// these would show modal windows (unsaved changes prompt, file pickers, error boxes) unless told not to; the server always does
+static constexpr UTF8StringView NonInteractiveEditorCommands[] {
+    "NewLevel",
+    "OpenLevelAtPath",
+    "OpenLevelByName",
+    "OpenLevelFile",
+    "OpenGameFolder",
+    "SaveLevel",
+    "SaveLevelAs"
 };
 
 const Class* FindEditorCommandClass(UTF8StringView name)
@@ -81,7 +87,19 @@ TResult<JSON::Value> ExecuteEditorCommandInternal(const String& name, const Arra
     }
 
     Handle<EditorCommandBase> command = boxed.Get<Handle<EditorCommandBase>>();
-    command->SetArguments(args);
+
+    Array<String> commandArgs = args;
+
+    for (const UTF8StringView& nonInteractive : NonInteractiveEditorCommands)
+    {
+        // eg. with unsaved changes they fail unless --save or --discard is passed, rather than asking
+        if (name == nonInteractive && !commandArgs.Contains(String("--no-dialogs")))
+        {
+            commandArgs.PushBack(String("--no-dialogs"));
+        }
+    }
+
+    command->SetArguments(commandArgs);
 
     TResult<JSON::Value> dispatchResult = DispatchSimThread(
         [command]() -> JSON::Value
@@ -588,7 +606,10 @@ void RegisterCommandMCPTools(MCPRouter& router)
 
     router.Register(MCPTool {
         "execute_editor_command",
-        "Execute an editor command by name in the running editor. Runs on the simulation thread, same as the editor console.",
+        "Execute an editor command by name in the running editor. Runs on the simulation thread, same as the editor console. "
+        "Level commands never show dialogs from here: NewLevel [name], OpenLevelAtPath <World .hmf | game folder>, OpenLevelByName <level>, "
+        "OpenGameFolder <folder>, SaveLevel [game folder], SaveLevelAs <new name>, SetStartupLevel [level]. "
+        "If the open level has unsaved changes, add '--save' or '--discard' to the args of commands that close it, otherwise they fail.",
         MakeToolInputSchema({ { "name", MakeStringSchemaProperty("Editor command name, e.g. 'BuildLightmaps', 'AddCube', 'CookGameContent'") },
                                 { "args", MakeArraySchemaProperty("Optional command arguments", "string") } }, { "name" }),
         [](const JSON::Object& args)
