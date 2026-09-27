@@ -206,6 +206,28 @@ TResult<BoxedValue> ResolveTargetOnSimThread(const JSON::Value& targetJson)
     return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "Target object must contain a 'uuid' field (nodes are resolved via query_scene)"));
 }
 
+bool CheckFieldTargetType(const Field* field, const BoxedValue& target, String& outError)
+{
+    const Class* expectedClass = TypeInfo_GetClass(field->GetTargetTypeInfo());
+    if (expectedClass == nullptr)
+    {
+        return true;
+    }
+
+    const TypeInfo* targetTypeInfo = target.GetTypeInfo();
+    const Class* actualClass = targetTypeInfo != nullptr ? TypeInfo_GetClass(*targetTypeInfo) : nullptr;
+
+    if (actualClass == nullptr || !IsA(expectedClass, actualClass))
+    {
+        outError = HYP_FORMAT("Target is not an instance of '{}' (field '{}' is declared on that class)",
+            expectedClass->GetName(), field->GetName());
+
+        return false;
+    }
+
+    return true;
+}
+
 TResult<JSON::Value> HandleListClasses(const JSON::Object& args)
 {
     String filter;
@@ -580,7 +602,19 @@ TResult<JSON::Value> HandleGetField(const JSON::Object& args)
                 return JSON::Value(std::move(result));
             }
 
-            BoxedValue value = field->Get(targetResult.GetValue());
+            BoxedValue target = targetResult.GetValue();
+
+            String typeError;
+            if (!CheckFieldTargetType(field, target, typeError))
+            {
+                JSON::Object result;
+                result.Set("ok", JSON::Value(false));
+                result.Set("error", JSON::Value(typeError));
+
+                return JSON::Value(std::move(result));
+            }
+
+            BoxedValue value = field->Get(target);
 
             JSON::Object resultObject;
             resultObject.Set("ok", JSON::Value(true));
@@ -662,6 +696,16 @@ TResult<JSON::Value> HandleSetField(const JSON::Object& args)
             }
 
             BoxedValue target = targetResult.GetValue();
+
+            String typeError;
+            if (!CheckFieldTargetType(field, target, typeError))
+            {
+                JSON::Object result;
+                result.Set("ok", JSON::Value(false));
+                result.Set("error", JSON::Value(typeError));
+
+                return JSON::Value(std::move(result));
+            }
 
             field->Set(target, value);
 

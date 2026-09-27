@@ -29,6 +29,7 @@ namespace MCP {
 
 namespace {
 
+/// @TODO: Store elsewhere so we don't require a recompile to change.
 static constexpr UTF8StringView SupportedImportExtensions[] {
     "obj", "fbx", "gltf", "glb", "mesh.xml", "skeleton.xml",
     "jpg", "jpeg", "png", "tga", "bmp", "psd", "gif", "hdr", "tif",
