@@ -8,13 +8,16 @@
 #include "MCPRouter.hpp"
 #include "MCPMarshal.hpp"
 #include "MCPJsonConvert.hpp"
+#include "MCPEditorAccess.hpp"
 
 #include <Editor/EditorState.hpp>
 #include <Editor/EditorSubsystem.hpp>
+#include <Editor/EditorProject.hpp>
 
 #include <Asset/SerializationUtils.hpp>
 
 #include <Scene/Scene.hpp>
+#include <Scene/World.hpp>
 #include <Scene/Node.hpp>
 #include <Scene/EntityManager.hpp>
 
@@ -34,6 +37,27 @@
 
 namespace Hyperion {
 namespace MCP {
+
+Handle<World> GetActiveEditorWorld()
+{
+    Handle<EditorSubsystem> subsystem = EditorState::GetInstance()->GetEditorSubsystem();
+    if (!subsystem.IsValid())
+    {
+        return Handle<World>::empty;
+    }
+
+    if (Handle<Scene> activeScene = subsystem->GetActiveScene(); activeScene.IsValid() && activeScene->GetWorld() != nullptr)
+    {
+        return MakeStrongRef(activeScene->GetWorld());
+    }
+
+    if (const Handle<EditorProject>& project = subsystem->GetCurrentProject(); project.IsValid())
+    {
+        return project->GetWorld();
+    }
+
+    return Handle<World>::empty;
+}
 
 namespace {
 
@@ -160,7 +184,7 @@ TResult<BoxedValue> ResolveTargetOnSimThread(const JSON::Value& targetJson)
         JSON::ParseResult parseResult = JSON::Parse(UTF8StringView(targetText.Data(), targetText.Data() + targetText.Size()));
         if (!parseResult.ok || !parseResult.value.IsObject())
         {
-            return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "Target must be an object with a 'uuid' field"));
+            return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "{}", String("Target must be an object with a 'uuid' field or {\"world\": true}")));
         }
 
         resolvedJson = parseResult.value;
@@ -168,10 +192,22 @@ TResult<BoxedValue> ResolveTargetOnSimThread(const JSON::Value& targetJson)
 
     if (!resolvedJson.IsObject())
     {
-        return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "Target must be an object with a 'uuid' field"));
+        return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "{}", String("Target must be an object with a 'uuid' field or {\"world\": true}")));
     }
 
     const JSON::Object& targetObject = resolvedJson.AsObject();
+
+    auto worldIt = targetObject.Find("world");
+    if (worldIt != targetObject.End() && worldIt->second.IsBool() && worldIt->second.AsBool())
+    {
+        Handle<World> world = GetActiveEditorWorld();
+        if (!world.IsValid())
+        {
+            return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "No world is open in the editor"));
+        }
+
+        return TResult<BoxedValue>(BoxedValue(world));
+    }
 
     auto uuidIt = targetObject.Find("uuid");
     if (uuidIt != targetObject.End() && uuidIt->second.IsString())
@@ -203,7 +239,7 @@ TResult<BoxedValue> ResolveTargetOnSimThread(const JSON::Value& targetJson)
         return TResult<BoxedValue>(BoxedValue(MakeStrongRef(node)));
     }
 
-    return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "Target object must contain a 'uuid' field (nodes are resolved via query_scene)"));
+    return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "{}", String("Target object must contain a 'uuid' field (nodes are resolved via query_scene) or be {\"world\": true}")));
 }
 
 bool CheckFieldTargetType(const Field* field, const BoxedValue& target, String& outError)
@@ -1196,7 +1232,7 @@ void RegisterReflectionMCPTools(MCPRouter& router)
 
     router.Register(MCPTool {
         "invoke_method",
-        "Invoke a reflected method on a class. For member methods pass target: {\"uuid\": \"...\"} - a node in the active scene from query_scene (other object types cannot be targeted); omit target for static methods. Args are positional and converted using reflection type info: Vec3f as [x, y, z]; Quat4f as [x, y, z, w]; Transform as {\"translation\": [x, y, z], \"scale\": [x, y, z], \"rotation\": [x, y, z, w]}; Name as a string. Common methods on a Node target: SetWorldTranslation([x, y, z]), SetLocalTranslation([x, y, z]), Translate([x, y, z]) (offset in local space), SetLocalRotation([x, y, z, w]), SetLocalScale([x, y, z]), SetName(\"...\"), AddChild({\"uuid\": \"...\"}) to re-parent a node. World space is left-handed, Y-up (+X right, +Y up, +Z forward; cameras look down +Z) in float world units. Use describe_class to discover methods and exact signatures.",
+        "Invoke a reflected method on a class. For member methods pass target: {\"uuid\": \"...\"} - a node in the active scene from query_scene - or {\"world\": true} for the open World (class World: environment settings, layers, swatches); omit target for static methods. Args are positional and converted using reflection type info: Vec3f as [x, y, z]; Quat4f as [x, y, z, w]; Transform as {\"translation\": [x, y, z], \"scale\": [x, y, z], \"rotation\": [x, y, z, w]}; Name as a string. Common methods on a Node target: SetWorldTranslation([x, y, z]), SetLocalTranslation([x, y, z]), Translate([x, y, z]) (offset in local space), SetLocalRotation([x, y, z, w]), SetLocalScale([x, y, z]), SetName(\"...\"), AddChild({\"uuid\": \"...\"}) to re-parent a node. World space is left-handed, Y-up (+X right, +Y up, +Z forward; cameras look down +Z) in float world units. Use describe_class to discover methods and exact signatures.",
         MakeToolInputSchema({ { "class", MakeStringSchemaProperty("Class name") },
                                 { "method", MakeStringSchemaProperty("Method name") },
                                 { "target", MakeSchemaProperty("object", "Target object: {\"uuid\": \"...\"} from query_scene (omit for static methods)") },
@@ -1209,7 +1245,7 @@ void RegisterReflectionMCPTools(MCPRouter& router)
 
     router.Register(MCPTool {
         "get_field",
-        "Get a reflected field value on a target object: target {\"uuid\": \"...\"} (a node in the active scene, from query_scene). Example: class=Node, field=LocalTransform returns {\"translation\": [x, y, z], \"scale\": [x, y, z], \"rotation\": [x, y, z, w]}. Use describe_class to discover field names.",
+        "Get a reflected field value on a target object: target {\"uuid\": \"...\"} (a node in the active scene, from query_scene) or {\"world\": true} (the open World). Example: class=Node, field=LocalTransform returns {\"translation\": [x, y, z], \"scale\": [x, y, z], \"rotation\": [x, y, z, w]}. Use describe_class to discover field names.",
         MakeToolInputSchema({ { "class", MakeStringSchemaProperty("Class name") },
                                 { "field", MakeStringSchemaProperty("Field name") },
                                 { "target", MakeSchemaProperty("object") } }, { "class", "field", "target" }),
@@ -1221,7 +1257,7 @@ void RegisterReflectionMCPTools(MCPRouter& router)
 
     router.Register(MCPTool {
         "set_field",
-        "Set a reflected field value on a target object: target {\"uuid\": \"...\"} (a node in the active scene, from query_scene). Value is converted using reflection type info: Vec3f as [x, y, z]; Quat4f as [x, y, z, w]; Transform as {\"translation\": [x, y, z], \"scale\": [x, y, z], \"rotation\": [x, y, z, w]} (e.g. class=Node, field=LocalTransform). World space is left-handed, Y-up (+X right, +Y up, +Z forward) in float world units. Prefer invoke_method with Node.SetWorldTranslation / SetLocalTranslation for positioning. Use describe_class to discover field names.",
+        "Set a reflected field value on a target object: target {\"uuid\": \"...\"} (a node in the active scene, from query_scene) or {\"world\": true} (the open World; for its environment prefer set_environment_settings). Value is converted using reflection type info: Vec3f as [x, y, z]; Quat4f as [x, y, z, w]; Transform as {\"translation\": [x, y, z], \"scale\": [x, y, z], \"rotation\": [x, y, z, w]} (e.g. class=Node, field=LocalTransform). World space is left-handed, Y-up (+X right, +Y up, +Z forward) in float world units. Prefer invoke_method with Node.SetWorldTranslation / SetLocalTranslation for positioning. Use describe_class to discover field names.",
         MakeToolInputSchema({ { "class", MakeStringSchemaProperty("Class name") },
                                 { "field", MakeStringSchemaProperty("Field name") },
                                 { "target", MakeSchemaProperty("object", "Target object: {\"uuid\": \"...\"} from query_scene") },
@@ -1266,7 +1302,7 @@ void RegisterReflectionMCPTools(MCPRouter& router)
 
     router.Register(MCPTool {
         "get_object",
-        "Serialize an object (resolved via target {\"uuid\": \"...\"} from query_scene) to JSON using the engine's reflection-based serializer: all reflected fields including nested values (e.g. Node.LocalTransform as {\"translation\": [x, y, z], \"scale\": [x, y, z], \"rotation\": [x, y, z, w]}, Entity components). Good for reading the full state of a node before modifying it.",
+        "Serialize an object (resolved via target {\"uuid\": \"...\"} from query_scene, or {\"world\": true} for the open World) to JSON using the engine's reflection-based serializer: all reflected fields including nested values (e.g. Node.LocalTransform as {\"translation\": [x, y, z], \"scale\": [x, y, z], \"rotation\": [x, y, z, w]}, Entity components). Good for reading the full state of a node before modifying it.",
         MakeToolInputSchema({ { "target", MakeSchemaProperty("object") } }, { "target" }),
         [](const JSON::Object& args)
         {

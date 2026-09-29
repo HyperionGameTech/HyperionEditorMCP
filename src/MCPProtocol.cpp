@@ -6,6 +6,7 @@
 
 #include "MCPProtocol.hpp"
 #include "MCPRouter.hpp"
+#include "MCPJsonConvert.hpp"
 
 #include <Core/Utilities/StringUtil.hpp>
 
@@ -31,6 +32,15 @@ JSON::Object MakeJsonRpcError(const JSON::Value& id, int code, const String& mes
     return response;
 }
 
+constexpr const char* s_serverInstructions =
+    "Hyperion editor bridge. Tips: "
+    "Shaders (.hlsl/.hlsli under Source/Shaders) hot reload on save - the engine rechecks them every ~3 seconds, so no editor restart is needed; "
+    "check get_logs with pattern 'Reloading' to confirm. "
+    "World-level state (environment, exposure/tonemapping, fog, sky, clouds) lives on the World, not a scene node: "
+    "use get_environment_settings / set_environment_settings, or pass target {\"world\": true} to get_field/set_field/invoke_method/get_object. "
+    "Use capture_viewport to see the rendered result (optionally moving the camera first) and get_editor_camera to reproduce a view. "
+    "Changes made here mark the level dirty; save with execute_editor_command SaveLevel.";
+
 JSON::Object MakeToolTextContent(const String& text, bool isError)
 {
     JSON::Object contentItem;
@@ -47,6 +57,37 @@ JSON::Object MakeToolTextContent(const String& text, bool isError)
     {
         result.Set("isError", JSON::Value(true));
     }
+
+    return result;
+}
+
+// tools return images under MCPImageContentKey; they go out as MCP image content next to the remaining JSON as text
+JSON::Object MakeToolResultContent(const JSON::Value& value)
+{
+    if (!value.IsObject() || !value.AsObject().Contains(String(MCPImageContentKey)))
+    {
+        return MakeToolTextContent(WriteJson(value), false);
+    }
+
+    JSON::Object textObject = value.AsObject();
+    const JSON::Object imageObject = textObject.Find(String(MCPImageContentKey))->second.AsObject();
+    textObject.Erase(String(MCPImageContentKey));
+
+    JSON::Object textItem;
+    textItem.Set("type", JSON::Value("text"));
+    textItem.Set("text", JSON::Value(WriteJson(JSON::Value(std::move(textObject)))));
+
+    JSON::Object imageItem;
+    imageItem.Set("type", JSON::Value("image"));
+    imageItem.Set("data", imageObject.Find(String("data"))->second);
+    imageItem.Set("mimeType", imageObject.Find(String("mimeType"))->second);
+
+    JSON::JArray contentArray;
+    contentArray.PushBack(JSON::Value(std::move(textItem)));
+    contentArray.PushBack(JSON::Value(std::move(imageItem)));
+
+    JSON::Object result;
+    result.Set("content", JSON::Value(std::move(contentArray)));
 
     return result;
 }
@@ -76,6 +117,7 @@ JSON::Object HandleInitialize(const JSON::Value& id, const JSON::Object& params)
     result.Set("protocolVersion", JSON::Value(protocolVersion));
     result.Set("capabilities", JSON::Value(std::move(capabilities)));
     result.Set("serverInfo", JSON::Value(std::move(serverInfo)));
+    result.Set("instructions", JSON::Value(ServerInstructions));
 
     JSON::Object response;
     response.Set("jsonrpc", JSON::Value("2.0"));
@@ -131,7 +173,7 @@ JSON::Object HandleToolsCall(const JSON::Value& id, const JSON::Object& params)
         JSON::Object response;
         response.Set("jsonrpc", JSON::Value("2.0"));
         response.Set("id", id);
-        response.Set("result", MakeToolTextContent(toolErrorValue.ToString(), true));
+        response.Set("result", MakeToolTextContent(WriteJson(toolErrorValue), true));
 
         return response;
     }
@@ -139,7 +181,7 @@ JSON::Object HandleToolsCall(const JSON::Value& id, const JSON::Object& params)
     JSON::Object response;
     response.Set("jsonrpc", JSON::Value("2.0"));
     response.Set("id", id);
-    response.Set("result", MakeToolTextContent(callResult.GetValue().ToString(), false));
+    response.Set("result", MakeToolResultContent(callResult.GetValue()));
 
     return response;
 }

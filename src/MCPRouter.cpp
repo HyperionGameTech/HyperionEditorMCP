@@ -14,6 +14,7 @@ void RegisterSystemMCPTools(MCPRouter& router);
 void RegisterCommandMCPTools(MCPRouter& router);
 void RegisterReflectionMCPTools(MCPRouter& router);
 void RegisterImportMCPTools(MCPRouter& router);
+void RegisterViewMCPTools(MCPRouter& router);
 
 MCPRouter& MCPRouter::GetInstance()
 {
@@ -28,6 +29,7 @@ MCPRouter& MCPRouter::GetInstance()
         RegisterCommandMCPTools(s_instance);
         RegisterReflectionMCPTools(s_instance);
         RegisterImportMCPTools(s_instance);
+        RegisterViewMCPTools(s_instance);
     }
 
     return s_instance;

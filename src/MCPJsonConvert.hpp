@@ -16,6 +16,10 @@
 namespace Hyperion {
 namespace MCP {
 
+/*! \brief Serialize to compact, spec-compliant JSON. The engine's JSON::Value::ToString uses C-style
+ *  escapes (\' \v \a) that strict JSON parsers reject, so everything sent to clients goes through this. */
+String WriteJson(const JSON::Value& value);
+
 /*! \brief Render a JSON value as a plain string (used for CVar SetFromString,
  *  commandlet argument building, etc). Strings are returned unquoted. */
 inline String JsonValueToString(const JSON::Value& value)

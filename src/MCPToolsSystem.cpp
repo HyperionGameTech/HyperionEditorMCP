@@ -20,19 +20,8 @@ namespace MCP {
 
 namespace {
 
-String SnapshotValueToString(const CVarSnapshotValue& value)
+double SnapshotValueToNumber(const CVarSnapshotValue& value)
 {
-    if (value.Is<bool>())
-    {
-        return value.GetUnchecked<bool>() ? "true" : "false";
-    }
-
-    if (value.Is<CVarString>())
-    {
-        return String(value.GetUnchecked<CVarString>());
-    }
-
-    // All remaining variants are numeric.
     double number = 0.0;
 
     if (value.Is<float>())
@@ -76,7 +65,7 @@ String SnapshotValueToString(const CVarSnapshotValue& value)
         number = double(value.GetUnchecked<uint64>());
     }
 
-    return JSON::Value(number).ToString();
+    return number;
 }
 
 JSON::Value SnapshotValueToJson(const CVarSnapshotValue& value)
@@ -88,55 +77,85 @@ JSON::Value SnapshotValueToJson(const CVarSnapshotValue& value)
 
     if (value.Is<CVarString>())
     {
-        return JSON::Value(String(value.GetUnchecked<CVarString>()));
+        const CVarString chars = value.GetUnchecked<CVarString>();
+
+        return JSON::Value(chars != nullptr ? String(chars) : String::empty);
     }
 
-    return JSON::Value(SnapshotValueToString(value));
+    return JSON::Value(SnapshotValueToNumber(value));
 }
 
-JSON::Value MakeCvarJson(CVarBase* cvar)
+// WriteToSnapshot is the only way to read a CVar's value without knowing its type. Reading it live
+// (rather than from the published snapshot) also reflects a set_cvar immediately
+struct CVarValueReader : CVarBase
 {
-    JSON::Object cvarObject;
-    cvarObject.Set("name", JSON::Value(String(cvar->name.LookupString())));
+    static void Read(const CVarBase* cvar, CVarSnapshotValue& outValue)
+    {
+        (cvar->*(&CVarValueReader::WriteToSnapshot))(outValue);
+    }
+};
+
+const char* GetSnapshotValueTypeName(const CVarSnapshotValue& value)
+{
+    if (value.Is<bool>())
+    {
+        return "bool";
+    }
+
+    if (value.Is<CVarString>())
+    {
+        return "string";
+    }
+
+    if (value.Is<float>() || value.Is<double>())
+    {
+        return "float";
+    }
+
+    return value.IsValid() ? "int" : "unknown";
+}
+
+void LogSnapshotDiagnosticsOnce()
+{
+    static bool s_logged = false;
+
+    if (s_logged)
+    {
+        return;
+    }
+
+    s_logged = true;
 
     const CVarManager& manager = CVarManager::GetInstance();
     const CVarSnapshot& snapshot = manager.GetCurrentSnapshot();
 
-    if (cvar->id >= 0 && cvar->id < snapshot.numVars)
-    {
-        cvarObject.Set("value", SnapshotValueToJson(snapshot.values[cvar->id]));
-    }
-    else
-    {
-        cvarObject.Set("value", JSON::Value(JSON::JSNull {}));
-    }
+    int maxId = -1;
 
-    // Type inference from the snapshot variant.
-    String type = "unknown";
-
-    if (cvar->id >= 0 && cvar->id < snapshot.numVars)
+    for (CVarBase* cvar : manager.cvars)
     {
-        const CVarSnapshotValue& value = snapshot.values[cvar->id];
-
-        if (value.Is<bool>())
+        if (cvar != nullptr)
         {
-            type = "bool";
-        }
-        else if (value.Is<CVarString>())
-        {
-            type = "string";
-        }
-        else if (value.Is<float>() || value.Is<double>())
-        {
-            type = "float";
-        }
-        else
-        {
-            type = "int";
+            maxId = MathUtil::Max(maxId, cvar->id);
         }
     }
 
-    cvarObject.Set("type", JSON::Value(type));
+    HYP_LOG(MCP, Info, "CVar snapshot diagnostics: numVars={} version={} registered={} maxId={} sizeof(CVarSnapshotValue)={} sizeof(CVarManager)={} snapshotOffset={}",
+        snapshot.numVars, snapshot.version, manager.cvars.Size(), maxId,
+        sizeof(CVarSnapshotValue), sizeof(CVarManager),
+        uintptr_t(&snapshot) - uintptr_t(&manager));
+}
+
+JSON::Value MakeCvarJson(CVarBase* cvar)
+{
+    LogSnapshotDiagnosticsOnce();
+
+    CVarSnapshotValue value;
+    CVarValueReader::Read(cvar, value);
+
+    JSON::Object cvarObject;
+    cvarObject.Set("name", JSON::Value(String(cvar->name.LookupString())));
+    cvarObject.Set("value", value.IsValid() ? SnapshotValueToJson(value) : JSON::Value(JSON::JSNull {}));
+    cvarObject.Set("type", JSON::Value(GetSnapshotValueTypeName(value)));
 
     return JSON::Value(std::move(cvarObject));
 }

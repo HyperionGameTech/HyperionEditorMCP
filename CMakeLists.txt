@@ -48,7 +48,18 @@ set(HYP_ENGINE_SOURCE_DIR "${HYP_ENGINE_ROOT}/Source")
 # Runtime binaries (hyperion.dll et al) go to <repo>/Binaries, import libraries to the
 # build tree at <repo>/Build (CMAKE_BINARY_DIR of the engine's Ninja build).
 set(HYP_ENGINE_BIN_DIR "${HYP_ENGINE_ROOT}/Binaries/${HYP_PLATFORM_NAME}/${HYP_BUILD_TYPE}")
-set(HYP_ENGINE_LIB_DIR "${HYP_ENGINE_ROOT}/Build/${HYP_PLATFORM_NAME}/${HYP_BUILD_TYPE}")
+
+# BuildHyperion.bat puts MinGW builds under Build/Windows-MinGW, and MinGW import
+# libraries follow the lib<name>.dll.a convention rather than <name>.lib
+if(MINGW)
+  set(HYP_ENGINE_LIB_DIR "${HYP_ENGINE_ROOT}/Build/${HYP_PLATFORM_NAME}-MinGW/${HYP_BUILD_TYPE}")
+  set(HYP_IMPORT_LIB_PREFIX "lib")
+  set(HYP_IMPORT_LIB_SUFFIX ".dll.a")
+else()
+  set(HYP_ENGINE_LIB_DIR "${HYP_ENGINE_ROOT}/Build/${HYP_PLATFORM_NAME}/${HYP_BUILD_TYPE}")
+  set(HYP_IMPORT_LIB_PREFIX "")
+  set(HYP_IMPORT_LIB_SUFFIX ".lib")
+endif()
 
 message(STATUS "HYP_ENGINE_ROOT: ${HYP_ENGINE_ROOT}")
 message(STATUS "HYP_ENGINE_BIN_DIR: ${HYP_ENGINE_BIN_DIR}")
@@ -74,17 +85,39 @@ function(hyp_resolve_engine_lib OUT_VAR SUBDIR NAME)
 endfunction()
 
 if(WIN32)
-  hyp_resolve_engine_lib(HYP_ENGINE_MAIN_LIB "" "hyperion.lib")
+  hyp_resolve_engine_lib(HYP_ENGINE_MAIN_LIB "" "${HYP_IMPORT_LIB_PREFIX}hyperion${HYP_IMPORT_LIB_SUFFIX}")
   if(NOT HYP_ENGINE_MAIN_LIB)
-    message(WARNING "hyperion.lib not found in ${HYP_ENGINE_LIB_DIR} - build the engine first, or adjust HYP_BUILD_TYPE")
+    message(WARNING "${HYP_IMPORT_LIB_PREFIX}hyperion${HYP_IMPORT_LIB_SUFFIX} not found in ${HYP_ENGINE_LIB_DIR} - build the engine first, or adjust HYP_BUILD_TYPE")
   endif()
 endif()
 
-# Engine version - keep in sync with the engine checkout this links against
-# (Source/CMakeLists.txt). Used for compile-time version macros.
-set(HYP_VERSION_MAJOR 1 CACHE STRING "")
-set(HYP_VERSION_MINOR 4 CACHE STRING "")
-set(HYP_VERSION_PATCH 0 CACHE STRING "")
+# Engine version - read from the engine checkout this links against
+# (Source/CMakeLists.txt) unless overridden with -DHYP_VERSION_<PART>=...
+file(STRINGS "${HYP_ENGINE_SOURCE_DIR}/CMakeLists.txt" _hyp_version_lines REGEX "^set\\(HYP_VERSION_(MAJOR|MINOR|PATCH) [0-9]+\\)")
+foreach(_line ${_hyp_version_lines})
+  string(REGEX MATCH "HYP_VERSION_(MAJOR|MINOR|PATCH) ([0-9]+)" _ "${_line}")
+  if(NOT DEFINED HYP_VERSION_${CMAKE_MATCH_1})
+    set(HYP_VERSION_${CMAKE_MATCH_1} ${CMAKE_MATCH_2})
+  endif()
+endforeach()
+message(STATUS "Engine version: ${HYP_VERSION_MAJOR}.${HYP_VERSION_MINOR}.${HYP_VERSION_PATCH}")
+
+# Some engine features change class layouts (HYP_STRATA_JIT -> ScriptObjectData,
+# HYP_OPENAL -> AudioManager), so take them from the engine's own CMake cache.
+set(HYP_ENGINE_STRATA_JIT ON)
+set(HYP_ENGINE_OPENAL OFF)
+if(EXISTS "${HYP_ENGINE_LIB_DIR}/CMakeCache.txt")
+  load_cache("${HYP_ENGINE_LIB_DIR}" READ_WITH_PREFIX HYP_ENGINE_CACHE_ STRATA_ENABLE_LLVM OPENAL_LIBRARY)
+  if(DEFINED HYP_ENGINE_CACHE_STRATA_ENABLE_LLVM AND NOT HYP_ENGINE_CACHE_STRATA_ENABLE_LLVM)
+    set(HYP_ENGINE_STRATA_JIT OFF)
+  endif()
+  if(HYP_ENGINE_CACHE_OPENAL_LIBRARY)
+    set(HYP_ENGINE_OPENAL ON)
+  endif()
+else()
+  message(WARNING "Engine CMakeCache.txt not found in ${HYP_ENGINE_LIB_DIR} - assuming Strata JIT on, OpenAL off")
+endif()
+message(STATUS "Engine Strata JIT: ${HYP_ENGINE_STRATA_JIT}, OpenAL: ${HYP_ENGINE_OPENAL}")
 
 # ---------------------------------------------------------------------------
 # Sources
@@ -109,12 +142,19 @@ target_compile_definitions(${BUILD_NAME} PRIVATE
   HYP_DOTNET=1
   HYP_DOTNET_ONLY_FOR_EDITOR=1
   HYP_STRATA=1
-  HYP_STRATA_JIT=1
   HYP_TESTS=1
   HYP_VERSION_MAJOR=${HYP_VERSION_MAJOR}
   HYP_VERSION_MINOR=${HYP_VERSION_MINOR}
   HYP_VERSION_PATCH=${HYP_VERSION_PATCH}
 )
+
+if(HYP_ENGINE_STRATA_JIT)
+  target_compile_definitions(${BUILD_NAME} PRIVATE HYP_STRATA_JIT=1)
+endif()
+
+if(HYP_ENGINE_OPENAL)
+  target_compile_definitions(${BUILD_NAME} PRIVATE HYP_OPENAL=1)
+endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   target_compile_definitions(${BUILD_NAME} PRIVATE HYP_DEBUG_MODE=1)
@@ -192,6 +232,10 @@ endif()
 # ---------------------------------------------------------------------------
 if(EXISTS "${HYP_ENGINE_ROOT}/External/ThirdParty/Source")
   target_include_directories(${BUILD_NAME} SYSTEM PRIVATE "${HYP_ENGINE_ROOT}/External/ThirdParty/Source")
+endif()
+
+if(EXISTS "${HYP_ENGINE_ROOT}/External/Submodules/stratac/include")
+  target_include_directories(${BUILD_NAME} SYSTEM PRIVATE "${HYP_ENGINE_ROOT}/External/Submodules/stratac/include")
 endif()
 
 if(HYP_RENDERING_BACKEND STREQUAL "Vulkan" AND DEFINED ENV{VULKAN_SDK})
@@ -273,10 +317,10 @@ if(WIN32)
   target_link_libraries(${BUILD_NAME} PRIVATE "${HYP_ENGINE_MAIN_LIB}")
   message(STATUS "Linking ${HYP_ENGINE_MAIN_LIB}")
 
-  foreach(HYP_SHARED_MODULE "Core/hyperion-core.lib" "Net/hyperion-net.lib" "Lang/hyperion-script.lib")
+  foreach(HYP_SHARED_MODULE "Core/hyperion-core" "Net/hyperion-net" "Lang/hyperion-script")
     get_filename_component(_subdir "${HYP_SHARED_MODULE}" DIRECTORY)
     get_filename_component(_name "${HYP_SHARED_MODULE}" NAME)
-    hyp_resolve_engine_lib(HYP_SHARED_MODULE_LIB "${_subdir}" "${_name}")
+    hyp_resolve_engine_lib(HYP_SHARED_MODULE_LIB "${_subdir}" "${HYP_IMPORT_LIB_PREFIX}${_name}${HYP_IMPORT_LIB_SUFFIX}")
     if(HYP_SHARED_MODULE_LIB)
       target_link_libraries(${BUILD_NAME} PRIVATE "${HYP_SHARED_MODULE_LIB}")
       message(STATUS "Linking ${HYP_SHARED_MODULE_LIB}")
@@ -285,6 +329,9 @@ if(WIN32)
 
   # MCP bridge server uses WinSock
   target_link_libraries(${BUILD_NAME} PRIVATE ws2_32)
+
+  # capture_viewport reads the editor window back through GDI
+  target_link_libraries(${BUILD_NAME} PRIVATE user32 gdi32)
 elseif(APPLE)
   target_link_libraries(${BUILD_NAME} PRIVATE "${HYP_ENGINE_BIN_DIR}/libhyperion.dylib")
 else()

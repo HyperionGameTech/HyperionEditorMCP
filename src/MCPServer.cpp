@@ -6,6 +6,7 @@
 
 #include "MCPServer.hpp"
 #include "MCPProtocol.hpp"
+#include "MCPJsonConvert.hpp"
 
 #include <Core/Utilities/StringUtil.hpp>
 
@@ -146,86 +147,6 @@ void SendResponse(int socket, int statusCode, const char* contentType, const Str
     }
 }
 
-String CompactJsonString(const String& json)
-{
-    String out;
-    out.Reserve(json.Size());
-
-    bool inString = false;
-    bool pendingEscape = false;
-
-    const char* chars = json.Data();
-    const size_t size = json.Size();
-
-    for (size_t i = 0; i < size; i++)
-    {
-        const char ch = chars[i];
-
-        if (inString)
-        {
-            if (pendingEscape)
-            {
-                pendingEscape = false;
-
-                switch (ch)
-                {
-                case '"':
-                case '\\':
-                case '/':
-                case 'b':
-                case 'f':
-                case 'n':
-                case 'r':
-                case 't':
-                case 'u':
-                    out.Append('\\'); // valid JSON escape - keep it
-                    break;
-                default:
-                    break; // invalid escape (e.g. \') - drop the backslash
-                }
-
-                out.Append(ch);
-
-                continue;
-            }
-
-            if (ch == '\\')
-            {
-                // Hold the backslash until we know the next char forms a valid escape.
-                pendingEscape = true;
-
-                continue;
-            }
-
-            if (ch == '"')
-            {
-                inString = false;
-            }
-
-            out.Append(ch);
-
-            continue;
-        }
-
-        if (ch == '"')
-        {
-            inString = true;
-            out.Append(ch);
-
-            continue;
-        }
-
-        if (ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t')
-        {
-            continue;
-        }
-
-        out.Append(ch);
-    }
-
-    return out;
-}
-
 } // namespace
 
 MCPServer& MCPServer::GetInstance()
@@ -326,7 +247,7 @@ void MCPServer::InstallLogRedirect()
     }
 
     m_logRedirectId = Logger::GetInstance().AddRedirect(
-        Bitset(~0u), // all channels
+        Bitset(uint64(-1)), // all channels
         this,
         &MCPServer::LogRedirectProc,
         &MCPServer::LogRedirectProc);
@@ -705,7 +626,7 @@ bool MCPServer::HandleHttpRequest(int clientSocket, const ANSIString& body)
         return false;
     }
 
-    SendResponse(clientSocket, 200, "application/json", CompactJsonString(JSON::Value(std::move(response)).ToString()));
+    SendResponse(clientSocket, 200, "application/json", WriteJson(JSON::Value(std::move(response))));
 
     return true;
 }
