@@ -32,7 +32,7 @@ JSON::Object MakeJsonRpcError(const JSON::Value& id, int code, const String& mes
     return response;
 }
 
-constexpr const char* s_serverInstructions =
+constexpr const char* ServerInstructions =
     "Hyperion editor bridge. Tips: "
     "Shaders (.hlsl/.hlsli under Source/Shaders) hot reload on save - the engine rechecks them every ~3 seconds, so no editor restart is needed; "
     "check get_logs with pattern 'Reloading' to confirm. "

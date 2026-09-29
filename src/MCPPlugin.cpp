@@ -22,6 +22,13 @@ public:
     {
         m_host = host;
 
+        // channels defined in plugins load after the engine's LogChannelRegistrar::RegisterAll, so they never get an id
+        // and no redirect (get_logs included) can see them; register ours dynamically instead
+        if (g_logChannel_MCP.id == ~0u)
+        {
+            m_logChannelHandle = new DynamicLogChannelHandle(Logger::GetInstance().CreateDynamicLogChannel(g_logChannel_MCP));
+        }
+
         // Touch the router so all tools register (and log) at load time
         // rather than on the first MCP request.
         MCPRouter::GetInstance();
@@ -47,10 +54,14 @@ public:
     {
         // Defensive: make sure the bridge is not serving while the host tears down.
         MCPServer::GetInstance().Stop();
+
+        delete m_logChannelHandle;
+        m_logChannelHandle = nullptr;
     }
 
 private:
     const IPluginHost* m_host = nullptr;
+    DynamicLogChannelHandle* m_logChannelHandle = nullptr;
 };
 
 MCPPlugin s_plugin;

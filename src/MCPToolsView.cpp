@@ -329,6 +329,11 @@ TResult<JSON::Value> HandleGetEditorCamera(const JSON::Object&)
         });
 }
 
+JSON::Value StatValue(double value)
+{
+    return JSON::Value(MathUtil::Round(value * 10000.0) / 10000.0);
+}
+
 JSON::Object ComputeImageStats(const CapturedImage& image)
 {
     // display-referred (sRGB-encoded) values, the same thing an image editor's histogram shows
@@ -382,17 +387,17 @@ JSON::Object ComputeImageStats(const CapturedImage& image)
     const double pixelScale = numPixels > 0 ? 1.0 / (double(numPixels) * 255.0) : 0.0;
 
     JSON::JArray meanRgb;
-    meanRgb.PushBack(JSON::Value(sums[0] * pixelScale));
-    meanRgb.PushBack(JSON::Value(sums[1] * pixelScale));
-    meanRgb.PushBack(JSON::Value(sums[2] * pixelScale));
+    meanRgb.PushBack(StatValue(sums[0] * pixelScale));
+    meanRgb.PushBack(StatValue(sums[1] * pixelScale));
+    meanRgb.PushBack(StatValue(sums[2] * pixelScale));
 
     JSON::Object stats;
-    stats.Set("meanLuminance", JSON::Value(luminanceSum * pixelScale));
-    stats.Set("p5Luminance", JSON::Value(percentile(0.05)));
-    stats.Set("p50Luminance", JSON::Value(percentile(0.5)));
-    stats.Set("p95Luminance", JSON::Value(percentile(0.95)));
+    stats.Set("meanLuminance", StatValue(luminanceSum * pixelScale));
+    stats.Set("p5Luminance", StatValue(percentile(0.05)));
+    stats.Set("p50Luminance", StatValue(percentile(0.5)));
+    stats.Set("p95Luminance", StatValue(percentile(0.95)));
     stats.Set("meanRgb", JSON::Value(std::move(meanRgb)));
-    stats.Set("meanSaturation", JSON::Value(numPixels > 0 ? saturationSum / double(numPixels) : 0.0));
+    stats.Set("meanSaturation", StatValue(numPixels > 0 ? saturationSum / double(numPixels) : 0.0));
 
     return stats;
 }
@@ -623,7 +628,7 @@ void RegisterViewMCPTools(MCPRouter& router)
         "plus display-referred stats (mean/p5/p50/p95 luminance, mean RGB, mean saturation, all 0-1). "
         "Optionally move the camera first with position [x, y, z] and/or direction [x, y, z] (world space: left-handed, Y-up); "
         "the capture then waits settleMs (default 1000 after a move, else 0) for the frame and TAA to settle. "
-        "The viewport must be visible on screen. Windows only.",
+        "Editor overlays (grid, stats bar, probe warnings) are included - set_cvar Editor.ShowGrid false for cleaner shots. The viewport must be visible on screen. Windows only.",
         MakeToolInputSchema({ { "position", MakeArraySchemaProperty("Optional camera world position [x, y, z]", "number") },
                                 { "direction", MakeArraySchemaProperty("Optional camera view direction [x, y, z]", "number") },
                                 { "settleMs", MakeSchemaProperty("number", "Milliseconds to wait before capturing (max 10000)") },
