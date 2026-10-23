@@ -15,13 +15,20 @@
 #include <Editor/EditorProject.hpp>
 
 #include <Asset/SerializationUtils.hpp>
+#include <Asset/AssetRegistry.hpp>
+#include <Asset/AssetObject.hpp>
+#include <Asset/AssetBucket.hpp>
 
 #include <Scene/Scene.hpp>
 #include <Scene/World.hpp>
 #include <Scene/WorldGrid/WorldGrid.hpp>
 #include <Scene/WorldGrid/WorldGridLayer.hpp>
 #include <Scene/Node.hpp>
+#include <Scene/Entity.hpp>
 #include <Scene/EntityManager.hpp>
+#include <Scene/Components/ScriptComponent.hpp>
+
+#include <Scripting/Asset/ScriptAsset.hpp>
 
 #include <Core/Reflection/Class.hpp>
 #include <Core/Reflection/ClassAttribute.hpp>
@@ -30,12 +37,25 @@
 #include <Core/Reflection/Member.hpp>
 #include <Core/Reflection/Method.hpp>
 #include <Core/Reflection/ObjectBase.hpp>
+#include <Core/Reflection/Property.hpp>
 #include <Core/Reflection/StaticField.hpp>
 #include <Core/Reflection/TypeInfo.hpp>
 
 #include <Core/Math/MathUtil.hpp>
 
 #include <Framework/EngineGlobals.hpp>
+
+namespace Hyperion {
+class ScriptObjectResource;
+} // namespace Hyperion
+
+// what the inspector uses to edit a script's fields (EntityScripting.cpp)
+extern "C"
+{
+    HYP_IMPORT Hyperion::ScriptObjectResource* ScriptComponent_GetScriptObject(Hyperion::ScriptComponent* scriptComponent);
+    HYP_IMPORT const Hyperion::Class* ScriptComponent_GetScriptClass(Hyperion::ScriptComponent* scriptComponent);
+    HYP_IMPORT Hyperion::int8 ScriptComponent_SetFieldValue(Hyperion::ScriptComponent* scriptComponent, const Hyperion::Property* property, const Hyperion::BoxedValue* value);
+}
 
 namespace Hyperion {
 namespace MCP {
@@ -146,6 +166,84 @@ JSON::Value CoerceStringifiedValue(const JSON::Value& value, const TypeInfo& typ
 
 TResult<BoxedValue> ResolveTargetOnSimThread(const JSON::Value& targetJson);
 
+const AssetBucket* FindAssetBucket(const String& bucketName)
+{
+    const String lowerName = bucketName.ToLower();
+
+    for (uint32 bucketIndex = 1; bucketIndex < MaxAssetBuckets; bucketIndex++)
+    {
+        if (String(GetAssetBucketName(bucketIndex)).ToLower() == lowerName)
+        {
+            return AssetBuckets::AllBuckets[bucketIndex];
+        }
+    }
+
+    return nullptr;
+}
+
+TResult<BoxedValue> ResolveComponentTarget(Node* node, const String& componentClassName)
+{
+    const Class* componentClass = ClassRegistry::GetInstance().GetClass(componentClassName.ToAnsi(), /* ignoreCase */ true);
+    if (componentClass == nullptr)
+    {
+        return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "No component class found with name '{}'", componentClassName));
+    }
+
+    if (!node->IsA<Entity>())
+    {
+        return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "Node '{}' is not an Entity, so it has no components", node->GetName()));
+    }
+
+    Entity* entity = static_cast<Entity*>(node);
+
+    EntityManager* entityManager = entity->GetEntityManager();
+    if (entityManager == nullptr)
+    {
+        return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "Entity '{}' has no EntityManager", node->GetName()));
+    }
+
+    AnyRef componentRef = entityManager->TryGetComponent(componentClass->GetTypeId(), entity);
+    if (!componentRef.HasValue())
+    {
+        return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "Entity '{}' has no '{}' component", node->GetName(), componentClass->GetName()));
+    }
+
+    return TResult<BoxedValue>(BoxedValue(std::move(componentRef)));
+}
+
+// "Materials/RockMaterial": bucket name, then the asset's name within the bucket
+TResult<BoxedValue> ResolveAssetTarget(const String& assetPath)
+{
+    const size_t separatorIndex = assetPath.FindFirstIndex('/');
+    if (separatorIndex == String::NotFound || separatorIndex == 0 || separatorIndex + 1 >= assetPath.Length())
+    {
+        return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "Asset target must be '<Bucket>/<Name>', e.g. 'Materials/Rock' (see list_assets)"));
+    }
+
+    const String bucketName(assetPath.Substr(0, separatorIndex));
+    const String assetName(assetPath.Substr(separatorIndex + 1));
+
+    const AssetBucket* bucket = FindAssetBucket(bucketName);
+    if (bucket == nullptr)
+    {
+        return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "Unknown asset bucket '{}'", bucketName));
+    }
+
+    Handle<AssetRegistry> registry = GetCurrentAssetRegistry();
+    if (!registry.IsValid())
+    {
+        return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "No asset registry; open a project first"));
+    }
+
+    Handle<AssetObject> asset = registry->GetAsset(*bucket, Name(assetName.ToAnsi()));
+    if (!asset.IsValid())
+    {
+        return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "No asset '{}' in bucket {}", assetName, bucketName));
+    }
+
+    return TResult<BoxedValue>(BoxedValue(std::move(asset)));
+}
+
 bool TryResolveNodeHandleFromJson(const JSON::Value& json, const TypeInfo& typeInfo, BoxedValue& outBoxed)
 {
     if (!typeInfo.IsHandleType() || !json.IsObject())
@@ -154,13 +252,21 @@ bool TryResolveNodeHandleFromJson(const JSON::Value& json, const TypeInfo& typeI
     }
 
     const Class* handleClass = typeInfo.GetClass();
-    if (handleClass == nullptr || !IsA(Node::StaticClass(), handleClass))
+    if (handleClass == nullptr || !(IsA(Node::StaticClass(), handleClass) || IsA(AssetObject::StaticClass(), handleClass)))
     {
         return false;
     }
 
     TResult<BoxedValue> resolved = ResolveTargetOnSimThread(json);
     if (resolved.HasError())
+    {
+        return false;
+    }
+
+    const TypeInfo* resolvedTypeInfo = resolved.GetValue().GetTypeInfo();
+    const Class* resolvedClass = resolvedTypeInfo != nullptr ? TypeInfo_GetClass(*resolvedTypeInfo) : nullptr;
+
+    if (resolvedClass == nullptr || !IsA(handleClass, resolvedClass))
     {
         return false;
     }
@@ -223,7 +329,13 @@ TResult<BoxedValue> ResolveTargetOnSimThread(const JSON::Value& targetJson)
         return TResult<BoxedValue>(BoxedValue(subsystem->GetCurrentProject()));
     }
 
+    // "editor" is accepted as an alias of "subsystem"
     auto subsystemIt = targetObject.Find("subsystem");
+    if (subsystemIt == targetObject.End())
+    {
+        subsystemIt = targetObject.Find("editor");
+    }
+
     if (subsystemIt != targetObject.End() && subsystemIt->second.IsBool() && subsystemIt->second.AsBool())
     {
         Handle<EditorSubsystem> subsystem = EditorState::GetInstance()->GetEditorSubsystem();
@@ -301,10 +413,42 @@ TResult<BoxedValue> ResolveTargetOnSimThread(const JSON::Value& targetJson)
             return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "No node found with UUID '{}' in the active scene", uuidIt->second.AsString()));
         }
 
-        return TResult<BoxedValue>(BoxedValue(MakeStrongRef(node)));
+        auto componentIt = targetObject.Find("component");
+        if (componentIt == targetObject.End() || !componentIt->second.IsString())
+        {
+            return TResult<BoxedValue>(BoxedValue(MakeStrongRef(node)));
+        }
+
+        return ResolveComponentTarget(node, componentIt->second.AsString());
     }
 
-    return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "{}", String("Target object must contain a 'uuid' field (nodes are resolved via query_scene) or be {\"world\": true}, {\"project\": true}, {\"subsystem\": true} or {\"layer\": \"<layer or class name>\"}")));
+    auto assetIt = targetObject.Find("asset");
+    if (assetIt != targetObject.End() && assetIt->second.IsString())
+    {
+        return ResolveAssetTarget(assetIt->second.AsString());
+    }
+
+    return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "{}", String("Target object must contain a 'uuid' field (nodes are resolved via query_scene, add 'component' for one of an entity's components) or 'asset', or be {\"world\": true}, {\"project\": true}, {\"subsystem\": true} or {\"layer\": \"<layer or class name>\"}")));
+}
+
+bool IsReadOnlyMethodName(Name methodName)
+{
+    const String name(methodName.LookupString());
+
+    return name.StartsWith("Get") || name.StartsWith("Is") || name.StartsWith("Has") || name.StartsWith("Find");
+}
+
+void MarkTargetAssetDirty(const BoxedValue& target)
+{
+    if (!target.Is<Handle<AssetObject>>())
+    {
+        return;
+    }
+
+    if (const Handle<AssetObject>& asset = target.Get<Handle<AssetObject>>(); asset.IsValid())
+    {
+        asset->MarkDirty();
+    }
 }
 
 bool CheckFieldTargetType(const Field* field, const BoxedValue& target, String& outError)
@@ -519,6 +663,32 @@ TResult<JSON::Value> HandleDescribeClass(const JSON::Object& args)
 
     classObject.Set("staticFields", JSON::Value(std::move(staticFieldsArray)));
 
+    // includes the [HypField] / [HypProperty] members of script and C# classes, which have no native Field
+    JSON::JArray propertiesArray;
+
+    for (const Property* property : cls->GetPropertiesInherited())
+    {
+        if (memberCount >= MaxDescribedMembers)
+        {
+            break;
+        }
+
+        if (!IsScriptBound(property))
+        {
+            continue;
+        }
+
+        JSON::Object propertyObject;
+        propertyObject.Set("name", JSON::Value(property->GetName().ToString()));
+        propertyObject.Set("type", JSON::Value(GetTypeName(property->GetTypeInfo())));
+        propertyObject.Set("canSet", JSON::Value(property->CanSet()));
+
+        propertiesArray.PushBack(JSON::Value(std::move(propertyObject)));
+        memberCount++;
+    }
+
+    classObject.Set("properties", JSON::Value(std::move(propertiesArray)));
+
     return TResult<JSON::Value>(std::move(classObject));
 }
 
@@ -642,6 +812,11 @@ TResult<JSON::Value> HandleInvokeMethod(const JSON::Object& args)
             }
 
             BoxedValue result = method->Invoke(Span<BoxedValue>(invokeArgs.Data(), invokeArgs.Size()));
+
+            if (isMember && !IsReadOnlyMethodName(method->GetName()))
+            {
+                MarkTargetAssetDirty(invokeArgs[0]);
+            }
 
             JSON::Object resultObject;
             resultObject.Set("ok", JSON::Value(true));
@@ -809,6 +984,8 @@ TResult<JSON::Value> HandleSetField(const JSON::Object& args)
             }
 
             field->Set(target, value);
+
+            MarkTargetAssetDirty(target);
 
             JSON::Object resultObject;
             resultObject.Set("ok", JSON::Value(true));
@@ -1268,6 +1445,366 @@ TResult<JSON::Value> HandleAddComponent(const JSON::Object& args)
         });
 }
 
+TResult<JSON::Value> HandleListAssets(const JSON::Object& args)
+{
+    const AssetBucket* onlyBucket = nullptr;
+
+    if (auto bucketIt = args.Find("bucket"); bucketIt != args.End() && bucketIt->second.IsString())
+    {
+        onlyBucket = FindAssetBucket(bucketIt->second.AsString());
+
+        if (onlyBucket == nullptr)
+        {
+            return TResult<JSON::Value>(HYP_MAKE_ERROR(Error, "Unknown asset bucket '{}'", bucketIt->second.AsString()));
+        }
+    }
+
+    String filter;
+
+    if (auto filterIt = args.Find("filter"); filterIt != args.End() && filterIt->second.IsString())
+    {
+        filter = filterIt->second.AsString().ToLower();
+    }
+
+    uint32 limit = 500;
+
+    if (auto limitIt = args.Find("limit"); limitIt != args.End() && limitIt->second.IsNumber())
+    {
+        limit = limitIt->second.ToUInt32(500);
+    }
+
+    return DispatchSimThread(
+        [onlyBucket, filter, limit]() -> JSON::Value
+        {
+            JSON::Object result;
+
+            Handle<AssetRegistry> registry = GetCurrentAssetRegistry();
+            if (!registry.IsValid())
+            {
+                result.Set("ok", JSON::Value(false));
+                result.Set("error", JSON::Value(String("No asset registry; open a project first")));
+
+                return JSON::Value(std::move(result));
+            }
+
+            JSON::JArray assetsArray;
+
+            for (uint32 bucketIndex = 1; bucketIndex < MaxAssetBuckets && assetsArray.Size() < limit; bucketIndex++)
+            {
+                if (onlyBucket != nullptr && onlyBucket->GetIndex() != bucketIndex)
+                {
+                    continue;
+                }
+
+                Array<AssetDesc> descs;
+                registry->GetBucketAssetDescs(bucketIndex, descs);
+
+                for (const AssetDesc& desc : descs)
+                {
+                    const String path = HYP_FORMAT("{}/{}", GetAssetBucketName(bucketIndex), desc.name);
+
+                    if (filter.Any() && !path.ToLower().Contains(filter))
+                    {
+                        continue;
+                    }
+
+                    assetsArray.PushBack(JSON::Value(path));
+
+                    if (assetsArray.Size() >= limit)
+                    {
+                        break;
+                    }
+                }
+            }
+
+            result.Set("ok", JSON::Value(true));
+            result.Set("assets", JSON::Value(std::move(assetsArray)));
+
+            return JSON::Value(std::move(result));
+        });
+}
+
+JSON::Value MakeErrorResult(const String& message)
+{
+    JSON::Object result;
+    result.Set("ok", JSON::Value(false));
+    result.Set("error", JSON::Value(message));
+
+    return JSON::Value(std::move(result));
+}
+
+// An entity's script, as the inspector edits it: the script class's properties, set on the live script object
+struct ScriptTarget
+{
+    ScriptComponent* component = nullptr;
+    Entity* entity = nullptr;
+    const Class* scriptClass = nullptr;
+    BoxedValue target;
+};
+
+TResult<ScriptTarget> ResolveScriptTargetOnSimThread(const JSON::Value& targetJson)
+{
+    TResult<BoxedValue> nodeResult = ResolveTargetOnSimThread(targetJson);
+
+    if (nodeResult.HasError())
+    {
+        return TResult<ScriptTarget>(nodeResult.GetError());
+    }
+
+    if (!nodeResult.GetValue().Is<Handle<ObjectBase>>())
+    {
+        return TResult<ScriptTarget>(HYP_MAKE_ERROR(Error, "Script target must be a node, by uuid"));
+    }
+
+    Handle<ObjectBase> nodeObject = nodeResult.GetValue().Get<Handle<ObjectBase>>();
+
+    if (!nodeObject.IsValid() || !nodeObject->IsA<Entity>())
+    {
+        return TResult<ScriptTarget>(HYP_MAKE_ERROR(Error, "Script target is not an Entity"));
+    }
+
+    Entity* entity = static_cast<Entity*>(nodeObject.Get());
+    EntityManager* entityManager = entity->GetEntityManager();
+
+    ScriptTarget scriptTarget;
+    scriptTarget.component = entityManager != nullptr ? entityManager->TryGetComponent<ScriptComponent>(entity) : nullptr;
+
+    if (scriptTarget.component == nullptr || !scriptTarget.component->script.IsValid())
+    {
+        return TResult<ScriptTarget>(HYP_MAKE_ERROR(Error, "Entity '{}' has no script", entity->GetName()));
+    }
+
+    ScriptObjectResource* scriptObject = ScriptComponent_GetScriptObject(scriptTarget.component);
+    scriptTarget.scriptClass = ScriptComponent_GetScriptClass(scriptTarget.component);
+    scriptTarget.entity = entity;
+
+    if (scriptObject == nullptr || scriptTarget.scriptClass == nullptr)
+    {
+        return TResult<ScriptTarget>(HYP_MAKE_ERROR(Error, "The script of entity '{}' isn't loaded or has no reflected fields", entity->GetName()));
+    }
+
+    scriptTarget.target = BoxedValue(AnyRef(scriptTarget.scriptClass->GetTypeInfo(), scriptObject));
+
+    return TResult<ScriptTarget>(std::move(scriptTarget));
+}
+
+JSON::Value DescribeValue(const BoxedValue& value)
+{
+    JSON::Object valueObject;
+
+    if (value.Is<Handle<ObjectBase>>())
+    {
+        const Handle<ObjectBase>& object = value.Get<Handle<ObjectBase>>();
+
+        if (!object.IsValid())
+        {
+            return JSON::Value(JSON::JSNull {});
+        }
+
+        valueObject.Set("class", JSON::Value(object->InstanceClass()->GetName().ToString()));
+
+        JSON::Object propertiesObject;
+
+        for (const Property* property : object->InstanceClass()->GetPropertiesInherited())
+        {
+            if (!property->CanGet() || !IsScriptBound(property))
+            {
+                continue;
+            }
+
+            JSON::Value propertyJson;
+
+            if (BoxedToJSON(property->Get(value), propertyJson, nullptr))
+            {
+                propertiesObject.Set(property->GetName().ToString(), std::move(propertyJson));
+            }
+        }
+
+        valueObject.Set("properties", JSON::Value(std::move(propertiesObject)));
+
+        return JSON::Value(std::move(valueObject));
+    }
+
+    JSON::Value valueJson;
+
+    if (BoxedToJSON(value, valueJson, nullptr))
+    {
+        return valueJson;
+    }
+
+    return JSON::Value(JSON::JSUndefined {});
+}
+
+// {"new": "ClassName", "properties": {...}} makes the object an object-typed property should hold, like the inspector's class picker
+TResult<BoxedValue> MakeNewObjectFromJson(const JSON::Object& newObjectJson)
+{
+    auto classIt = newObjectJson.Find("new");
+
+    const Class* cls = ClassRegistry::GetInstance().GetClass(classIt->second.ToString().ToAnsi(), /* ignoreCase */ true);
+
+    if (cls == nullptr || cls->IsAbstract() || !cls->CanCreateInstance())
+    {
+        return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "No class '{}' that can be instantiated", classIt->second.ToString()));
+    }
+
+    BoxedValue object;
+
+    if (!cls->CreateInstance(object))
+    {
+        return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "Failed to create an instance of {}", cls->GetName()));
+    }
+
+    if (auto propertiesIt = newObjectJson.Find("properties"); propertiesIt != newObjectJson.End() && propertiesIt->second.IsObject())
+    {
+        for (const auto& it : propertiesIt->second.AsObject())
+        {
+            const Property* property = cls->GetProperty(StringHash(it.first.ToAnsi()));
+
+            if (property == nullptr || !property->CanSet())
+            {
+                return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "{} has no settable property '{}'", cls->GetName(), it.first));
+            }
+
+            BoxedValue propertyValue;
+
+            if (Result convertResult = BoxedFromJSON(CoerceStringifiedValue(it.second, property->GetTypeInfo()), property->GetTypeInfo(), propertyValue); convertResult.HasError())
+            {
+                return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "{}.{}: {}", cls->GetName(), it.first, convertResult.GetError().GetMessage()));
+            }
+
+            property->Set(object, propertyValue);
+        }
+    }
+
+    return TResult<BoxedValue>(std::move(object));
+}
+
+TResult<JSON::Value> HandleGetScriptFields(const JSON::Object& args)
+{
+    auto targetIt = args.Find("target");
+
+    if (targetIt == args.End())
+    {
+        return TResult<JSON::Value>(HYP_MAKE_ERROR(Error, "get_script_fields requires a target entity, by uuid"));
+    }
+
+    JSON::Value targetJson = targetIt->second;
+
+    return DispatchSimThread(
+        [targetJson]() -> JSON::Value
+        {
+            TResult<ScriptTarget> scriptResult = ResolveScriptTargetOnSimThread(targetJson);
+
+            if (scriptResult.HasError())
+            {
+                return MakeErrorResult(String(scriptResult.GetError().GetMessage()));
+            }
+
+            const ScriptTarget& script = scriptResult.GetValue();
+
+            JSON::JArray fieldsArray;
+
+            for (const Property* property : script.scriptClass->GetPropertiesInherited())
+            {
+                if (!IsScriptBound(property))
+                {
+                    continue;
+                }
+
+                JSON::Object fieldObject;
+                fieldObject.Set("name", JSON::Value(property->GetName().ToString()));
+                fieldObject.Set("type", JSON::Value(GetTypeName(property->GetTypeInfo())));
+                fieldObject.Set("canSet", JSON::Value(property->CanSet()));
+
+                if (property->CanGet())
+                {
+                    fieldObject.Set("value", DescribeValue(property->Get(script.target)));
+                }
+
+                fieldsArray.PushBack(JSON::Value(std::move(fieldObject)));
+            }
+
+            JSON::Object result;
+            result.Set("ok", JSON::Value(true));
+            result.Set("class", JSON::Value(script.scriptClass->GetName().ToString()));
+            result.Set("fields", JSON::Value(std::move(fieldsArray)));
+
+            return JSON::Value(std::move(result));
+        });
+}
+
+TResult<JSON::Value> HandleSetScriptField(const JSON::Object& args)
+{
+    auto targetIt = args.Find("target");
+    auto fieldIt = args.Find("field");
+    auto valueIt = args.Find("value");
+
+    if (targetIt == args.End() || fieldIt == args.End() || !fieldIt->second.IsString() || valueIt == args.End())
+    {
+        return TResult<JSON::Value>(HYP_MAKE_ERROR(Error, "set_script_field requires a target entity (by uuid), a field name and a value"));
+    }
+
+    JSON::Value targetJson = targetIt->second;
+    String fieldName = fieldIt->second.AsString();
+    JSON::Value valueJson = valueIt->second;
+
+    return DispatchSimThread(
+        [targetJson, fieldName, valueJson]() -> JSON::Value
+        {
+            TResult<ScriptTarget> scriptResult = ResolveScriptTargetOnSimThread(targetJson);
+
+            if (scriptResult.HasError())
+            {
+                return MakeErrorResult(String(scriptResult.GetError().GetMessage()));
+            }
+
+            const ScriptTarget& script = scriptResult.GetValue();
+            const Property* property = script.scriptClass->GetProperty(StringHash(fieldName.ToAnsi()));
+
+            if (property == nullptr || !property->CanSet())
+            {
+                return MakeErrorResult(HYP_FORMAT("{} has no settable field '{}'", script.scriptClass->GetName(), fieldName));
+            }
+
+            BoxedValue value;
+
+            if (valueJson.IsObject() && valueJson.AsObject().Contains("new"))
+            {
+                TResult<BoxedValue> objectResult = MakeNewObjectFromJson(valueJson.AsObject());
+
+                if (objectResult.HasError())
+                {
+                    return MakeErrorResult(String(objectResult.GetError().GetMessage()));
+                }
+
+                value = objectResult.GetValue();
+            }
+            else if (valueJson.IsNullOrUndefined() && property->GetTypeInfo().IsHandleType())
+            {
+                value = BoxedValue(Handle<ObjectBase>());
+            }
+            else if (!TryResolveNodeHandleFromJson(valueJson, property->GetTypeInfo(), value))
+            {
+                if (Result convertResult = BoxedFromJSON(CoerceStringifiedValue(valueJson, property->GetTypeInfo()), property->GetTypeInfo(), value); convertResult.HasError())
+                {
+                    return MakeErrorResult(String("Failed to convert value: ") + String(convertResult.GetError().GetMessage()));
+                }
+            }
+
+            if (!ScriptComponent_SetFieldValue(script.component, property, &value))
+            {
+                return MakeErrorResult(HYP_FORMAT("Setting {}.{} failed", script.scriptClass->GetName(), fieldName));
+            }
+
+            script.entity->MarkDirty();
+
+            JSON::Object result;
+            result.Set("ok", JSON::Value(true));
+            result.Set("value", DescribeValue(property->Get(script.target)));
+
+            return JSON::Value(std::move(result));
+        });
+}
 
 } // namespace
 
@@ -1297,7 +1834,7 @@ void RegisterReflectionMCPTools(MCPRouter& router)
 
     router.Register(MCPTool {
         "invoke_method",
-        "Invoke a reflected method on a class. For member methods pass target: {\"uuid\": \"...\"} - a node in the active scene from query_scene - or {\"world\": true} for the open World (class World: environment settings, layers, swatches), {\"project\": true} for the open EditorProject (e.g. SaveAs(\"C:/path/Folder\") saves without a dialog), {\"subsystem\": true} for the EditorSubsystem, or {\"layer\": \"Terrain\"} for a world grid layer by name or class (e.g. TerrainWorldGridLayer.SetLayerInfo); omit target for static methods. Args are positional and converted using reflection type info: Vec3f as [x, y, z]; Quat4f as [x, y, z, w]; Transform as {\"Translation\": [x, y, z], \"Scale\": [x, y, z], \"Rotation\": {\"X\": 0, \"Y\": 0, \"Z\": 0, \"W\": 1}} (keys are case sensitive - lowercase keys are silently ignored); Name as a string. Common methods on a Node target: SetWorldTranslation([x, y, z], 0), SetLocalTranslation([x, y, z], 0), Translate([x, y, z]) (offset in local space), SetLocalRotation([x, y, z, w], 0), SetLocalScale([x, y, z], 0) - the trailing 0 is TransformChangeType::Default, there are no default arguments, SetName(\"...\"), AddChild({\"uuid\": \"...\"}) to re-parent a node. World space is left-handed, Y-up (+X right, +Y up, +Z forward; cameras look down +Z) in float world units. Use describe_class to discover methods and exact signatures.",
+        "Invoke a reflected method on a class. For member methods pass a target, omit it for static methods. Targets: {\"uuid\": \"...\"} for a node in the active scene (from query_scene); {\"uuid\": \"...\", \"component\": \"MeshComponent\"} for one of that entity's components (class = the component class); {\"asset\": \"Materials/Rock\"} for a project asset (from list_assets, edits mark it dirty so SaveProject writes it); {\"world\": true} for the open World (class World: environment settings, layers, swatches); {\"project\": true} for the open EditorProject (e.g. SaveAs(\"C:/path/Folder\") saves without a dialog); {\"subsystem\": true} for the EditorSubsystem (class = EditorSubsystem, e.g. AddToSelection({\"uuid\": \"...\"}) / ClearSelection()); {\"layer\": \"Terrain\"} for a world grid layer by name or class (e.g. TerrainWorldGridLayer.SetLayerInfo). Handle arguments accept the same {\"uuid\"} / {\"asset\"} objects. Args are positional and converted using reflection type info: Vec3f as [x, y, z]; Quat4f as [x, y, z, w]; Transform as {\"Translation\": [x, y, z], \"Scale\": [x, y, z], \"Rotation\": {\"X\": 0, \"Y\": 0, \"Z\": 0, \"W\": 1}} (keys are case sensitive - lowercase keys are silently ignored); Name as a string. Common methods on a Node target: SetWorldTranslation([x, y, z], 0), SetLocalTranslation([x, y, z], 0), Translate([x, y, z]) (offset in local space), SetLocalRotation([x, y, z, w], 0), SetLocalScale([x, y, z], 0) - the trailing 0 is TransformChangeType::Default, there are no default arguments, SetName(\"...\"), AddChild({\"uuid\": \"...\"}) to re-parent a node. World space is left-handed, Y-up (+X right, +Y up, +Z forward; cameras look down +Z) in float world units. Use describe_class to discover methods and exact signatures.",
         MakeToolInputSchema({ { "class", MakeStringSchemaProperty("Class name") },
                                 { "method", MakeStringSchemaProperty("Method name") },
                                 { "target", MakeSchemaProperty("object", "Target object: {\"uuid\": \"...\"} from query_scene (omit for static methods)") },
@@ -1310,7 +1847,7 @@ void RegisterReflectionMCPTools(MCPRouter& router)
 
     router.Register(MCPTool {
         "get_field",
-        "Get a reflected field value on a target object: target {\"uuid\": \"...\"} (a node in the active scene, from query_scene) or {\"world\": true} (the open World). Example: class=Node, field=LocalTransform returns {\"translation\": [x, y, z], \"scale\": [x, y, z], \"rotation\": [x, y, z, w]}. Use describe_class to discover field names.",
+        "Get a reflected field value on a target. Targets: {\"uuid\": \"...\"} for a node in the active scene (from query_scene); {\"uuid\": \"...\", \"component\": \"MeshComponent\"} for one of that entity's components (class = the component class); {\"asset\": \"Materials/Rock\"} for a project asset (from list_assets); {\"world\": true} for the open World; {\"project\": true}, {\"subsystem\": true} or {\"layer\": \"Terrain\"} as for invoke_method. Example: class=Node, field=LocalTransform returns {\"translation\": [x, y, z], \"scale\": [x, y, z], \"rotation\": [x, y, z, w]}. Use describe_class to discover field names.",
         MakeToolInputSchema({ { "class", MakeStringSchemaProperty("Class name") },
                                 { "field", MakeStringSchemaProperty("Field name") },
                                 { "target", MakeSchemaProperty("object") } }, { "class", "field", "target" }),
@@ -1322,7 +1859,7 @@ void RegisterReflectionMCPTools(MCPRouter& router)
 
     router.Register(MCPTool {
         "set_field",
-        "Set a reflected field value on a target object: target {\"uuid\": \"...\"} (a node in the active scene, from query_scene) or {\"world\": true} (the open World; for its environment prefer set_environment_settings). Value is converted using reflection type info: Vec3f as [x, y, z]; Quat4f as [x, y, z, w]; Transform as {\"Translation\": [x, y, z], \"Scale\": [x, y, z], \"Rotation\": {\"X\": 0, \"Y\": 0, \"Z\": 0, \"W\": 1}} (keys are case sensitive - lowercase keys are silently ignored) (e.g. class=Node, field=LocalTransform). World space is left-handed, Y-up (+X right, +Y up, +Z forward) in float world units. Prefer invoke_method with Node.SetWorldTranslation([x, y, z], 0) / SetLocalTranslation([x, y, z], 0) for positioning. Use describe_class to discover field names.",
+        "Set a reflected field value on a target. Targets: {\"uuid\": \"...\"} for a node in the active scene (from query_scene); {\"uuid\": \"...\", \"component\": \"MeshComponent\"} for one of that entity's components (class = the component class); {\"asset\": \"Materials/Rock\"} for a project asset (from list_assets, edits mark it dirty so SaveProject writes it); {\"world\": true} for the open World (for its environment prefer set_environment_settings); {\"project\": true}, {\"subsystem\": true} or {\"layer\": \"Terrain\"} as for invoke_method. Value is converted using reflection type info: Vec3f as [x, y, z]; Quat4f as [x, y, z, w]; Transform as {\"Translation\": [x, y, z], \"Scale\": [x, y, z], \"Rotation\": {\"X\": 0, \"Y\": 0, \"Z\": 0, \"W\": 1}} (keys are case sensitive - lowercase keys are silently ignored) (e.g. class=Node, field=LocalTransform). World space is left-handed, Y-up (+X right, +Y up, +Z forward) in float world units. Prefer invoke_method with Node.SetWorldTranslation([x, y, z], 0) / SetLocalTranslation([x, y, z], 0) for positioning. Use describe_class to discover field names.",
         MakeToolInputSchema({ { "class", MakeStringSchemaProperty("Class name") },
                                 { "field", MakeStringSchemaProperty("Field name") },
                                 { "target", MakeSchemaProperty("object", "Target object: {\"uuid\": \"...\"} from query_scene") },
@@ -1340,6 +1877,30 @@ void RegisterReflectionMCPTools(MCPRouter& router)
         [](const JSON::Object& args)
         {
             return HandleCreateInstance(args);
+        }
+    });
+
+    router.Register(MCPTool {
+        "get_script_fields",
+        "List the reflected fields ([HypField] / [HypProperty]) of the script on an entity's ScriptComponent, with their values: what the inspector's Script section shows. Object-typed fields give {\"class\": ..., \"properties\": {...}} or null. Target the entity: {\"uuid\": \"...\"} from query_scene.",
+        MakeToolInputSchema({ { "target", MakeSchemaProperty("object", "Entity with a ScriptComponent: {\"uuid\": \"...\"}") } }, { "target" }),
+        [](const JSON::Object& args)
+        {
+            return HandleGetScriptFields(args);
+        }
+    });
+
+    router.Register(MCPTool {
+        "set_script_field",
+        "Set a field of the script on an entity's ScriptComponent the way the inspector does: on the live script, and stored in the component so it is saved. "
+        "For an object-typed field, value {\"new\": \"ClassName\", \"properties\": {\"Speed\": 3}} creates an instance of that class (what the inspector's class picker does; list_classes with base: gives the choices) and null clears it; "
+        "node and asset handles take {\"uuid\"} / {\"asset\"} objects; other values convert as in set_field. Returns the field's new value.",
+        MakeToolInputSchema({ { "target", MakeSchemaProperty("object", "Entity with a ScriptComponent: {\"uuid\": \"...\"}") },
+                                { "field", MakeStringSchemaProperty("Script field name") },
+                                { "value", MakeAnySchemaProperty("New value") } }, { "target", "field", "value" }),
+        [](const JSON::Object& args)
+        {
+            return HandleSetScriptField(args);
         }
     });
 
@@ -1372,6 +1933,19 @@ void RegisterReflectionMCPTools(MCPRouter& router)
         [](const JSON::Object& args)
         {
             return HandleGetObject(args);
+        }
+    });
+
+    router.Register(MCPTool {
+        "list_assets",
+        "List assets in the open project as '<Bucket>/<Name>' paths, the form used by asset targets ({\"asset\": \"Materials/Rock\"}). "
+        "Optionally limit to one bucket (Meshes, Textures, Materials, Prefabs, Sounds, Scripts, ...) and filter by a case-insensitive substring.",
+        MakeToolInputSchema({ { "bucket", MakeStringSchemaProperty("Asset bucket name, e.g. 'Materials'") },
+                                { "filter", MakeStringSchemaProperty("Case-insensitive substring filter on the asset path") },
+                                { "limit", MakeSchemaProperty("number") } }, {}),
+        [](const JSON::Object& args)
+        {
+            return HandleListAssets(args);
         }
     });
 

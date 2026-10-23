@@ -43,7 +43,10 @@ static constexpr UTF8StringView NonInteractiveEditorCommands[] {
     "OpenLevelFile",
     "OpenGameFolder",
     "SaveLevel",
-    "SaveLevelAs"
+    "SaveLevelAs",
+    "RenameLevel",
+    "DeleteLevel",
+    "NewGame"
 };
 
 const Class* FindEditorCommandClass(UTF8StringView name)
@@ -608,8 +611,10 @@ void RegisterCommandMCPTools(MCPRouter& router)
         "execute_editor_command",
         "Execute an editor command by name in the running editor. Runs on the simulation thread, same as the editor console. "
         "Level commands never show dialogs from here: NewLevel [name], OpenLevelAtPath <World .hmf | game folder>, OpenLevelByName <level>, "
-        "OpenGameFolder <folder>, SaveLevel [game folder], SaveLevelAs <new name>, SetStartupLevel [level]. "
-        "If the open level has unsaved changes, add '--save' or '--discard' to the args of commands that close it, otherwise they fail.",
+        "OpenGameFolder <folder>, SaveLevel [game folder], SaveLevelAs <new name>, RenameLevel <new name>, DeleteLevel <level>, NewGame <name> (a game folder under Projects/), SetStartupLevel [level]. "
+        "If the open level has unsaved changes, add '--save' or '--discard' to the args of commands that close it, otherwise they fail. "
+        "Play / Pause / Stop switch simulation like the toolbar buttons (the switch completes a moment after the call returns). "
+        "CaptureViewport [file.png] [perspective|top|front|side] writes the active viewport's image; while simulating it captures the game camera's view (3D only, no UI).",
         MakeToolInputSchema({ { "name", MakeStringSchemaProperty("Editor command name, e.g. 'BuildLightmaps', 'AddCube', 'CookGameContent'") },
                                 { "args", MakeArraySchemaProperty("Optional command arguments", "string") } }, { "name" }),
         [](const JSON::Object& args)
