@@ -1392,7 +1392,7 @@ TResult<JSON::Value> HandleAddComponent(const JSON::Object& args)
                 return JSON::Value(std::move(result));
             }
 
-            Entity* entity = StaticCast<Entity>(node.Get());
+            Entity* entity = Cast<Entity>(node.Get());
 
             EntityManager* entityManager = entity->GetEntityManager();
             if (entityManager == nullptr)

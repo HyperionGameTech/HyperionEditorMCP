@@ -1,0 +1,6 @@
+PluginDescriptor "MCPBridge" {
+    Version = "1.0.0"
+    EngineMinVersion = "0.5.0"
+    Entry = "HyperionMCP.dll"
+    Host = Editor
+}

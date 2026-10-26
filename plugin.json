@@ -1,7 +1,0 @@
-{
-    "name": "MCPBridge",
-    "version": "1.0.0",
-    "engineMinVersion": "0.5.0",
-    "entry": "HyperionMCP.dll",
-    "host": "editor"
-}

@@ -362,7 +362,7 @@ set_target_properties(${BUILD_NAME} PROPERTIES
 
 add_custom_command(TARGET ${BUILD_NAME} POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      "${CMAKE_CURRENT_SOURCE_DIR}/plugin.json"
-      "${HYP_PLUGIN_OUTPUT_DIR}/plugin.json"
-  COMMENT "Copying plugin.json to ${HYP_PLUGIN_OUTPUT_DIR}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/MCPBridge.hypplugin"
+      "${HYP_PLUGIN_OUTPUT_DIR}/MCPBridge.hypplugin"
+  COMMENT "Copying MCPBridge.hypplugin to ${HYP_PLUGIN_OUTPUT_DIR}"
 )
