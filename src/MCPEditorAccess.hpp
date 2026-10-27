@@ -20,5 +20,8 @@ namespace MCP {
  *  Sim thread only. */
 Handle<World> GetActiveEditorWorld();
 
+/*! \brief Drop every instance create_instance is keeping alive. Call once the server has stopped. */
+void ClearRegisteredInstances();
+
 } // namespace MCP
 } // namespace Hyperion

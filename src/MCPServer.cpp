@@ -12,6 +12,7 @@
 
 #include <Core/Threading/Threads.hpp>
 
+#include <chrono>
 #include <cstdlib>
 #include <utility>
 
@@ -51,6 +52,7 @@ constexpr uint16 DefaultPort = 2673;
 constexpr uint32 MaxLogLines = MCPMaxLogLines;
 constexpr size_t MaxHeaderBytes = 32u * 1024u;                          // request head (line + headers)
 constexpr size_t MaxBodyBytes = 16u * 1024u * 1024u;                    // request body cap
+constexpr uint32 RequestReadTimeoutMs = 15 * 1000;                      // whole request (head + body) must arrive within this
 constexpr uint64 AcceptPollIntervalMs = 50;
 constexpr uint64 SelectTimeoutUs = 200 * 1000;                          // poll m_running periodically
 
@@ -78,6 +80,30 @@ void CloseSocketChecked(SOCKET& socket)
         closesocket(socket);
         socket = INVALID_SOCKET;
     }
+}
+
+// "host[:port]" (already lowercased) names this machine; anything else is a remote or rebound origin
+bool IsLoopbackAuthority(const String& authority)
+{
+    String host = authority;
+
+    if (authority.StartsWith("["))
+    {
+        const size_t close = authority.FindFirstIndex(']');
+
+        if (close == String::NotFound)
+        {
+            return false;
+        }
+
+        host = String(authority.Substr(0, close + 1));
+    }
+    else if (const size_t colon = authority.FindFirstIndex(':'); colon != String::NotFound)
+    {
+        host = String(authority.Substr(0, colon));
+    }
+
+    return host == String("localhost") || host == String("127.0.0.1") || host == String("[::1]");
 }
 
 bool SendAll(int socket, const char* data, size_t size)
@@ -109,6 +135,7 @@ const char* StatusText(int statusCode)
     case 200: return "OK";
     case 202: return "Accepted";
     case 400: return "Bad Request";
+    case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 408: return "Request Timeout";
@@ -395,6 +422,9 @@ void MCPServer::ServerThreadProc(uint16 port)
 
 void MCPServer::HandleConnection(int clientSocket)
 {
+    // Connections are served one at a time, so a client that stalls mid-request must not hold the bridge forever.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(RequestReadTimeoutMs);
+
     // Read the request head.
     ANSIString buffer;
     char readBuffer[8192];
@@ -403,6 +433,13 @@ void MCPServer::HandleConnection(int clientSocket)
 
     while (m_running.Load())
     {
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            SendResponse(clientSocket, 408, "application/json", String("{\"error\":\"request timed out\"}"));
+
+            return;
+        }
+
         // Look for the \r\n\r\n terminator.
         if (buffer.Size() >= 4)
         {
@@ -509,8 +546,11 @@ void MCPServer::HandleConnection(int clientSocket)
         return;
     }
 
-    // Find Content-Length in the headers.
+    // Find Content-Length in the headers. Origin / Host are checked as well: a web page open in the
+    // user's browser (or a DNS rebinding attack) must not be able to drive the editor through this port.
     size_t contentLength = 0;
+    bool originAllowed = true; // no Origin header = not a browser request
+    bool hostAllowed = true;
 
     {
         const ANSIStringView headers(head.Data() + lineEnd + 1, head.Data() + head.Size());
@@ -536,7 +576,28 @@ void MCPServer::HandleConnection(int clientSocket)
 
             String lowerLine = String(headerLine.Data(), headerLine.Data() + headerLine.Size()).ToLower();
 
-            if (lowerLine.StartsWith("content-length:"))
+            if (lowerLine.StartsWith("origin:"))
+            {
+                const String origin = String(lowerLine.Substr(String("origin:").Length())).Trimmed();
+
+                if (origin.StartsWith("http://"))
+                {
+                    originAllowed = IsLoopbackAuthority(String(origin.Substr(String("http://").Length())));
+                }
+                else if (origin.StartsWith("https://"))
+                {
+                    originAllowed = IsLoopbackAuthority(String(origin.Substr(String("https://").Length())));
+                }
+                else
+                {
+                    originAllowed = false;
+                }
+            }
+            else if (lowerLine.StartsWith("host:"))
+            {
+                hostAllowed = IsLoopbackAuthority(String(lowerLine.Substr(String("host:").Length())).Trimmed());
+            }
+            else if (lowerLine.StartsWith("content-length:"))
             {
                 String value = String(lowerLine.Substr(String("content-length:").Length())).Trimmed();
 
@@ -551,6 +612,13 @@ void MCPServer::HandleConnection(int clientSocket)
         }
     }
 
+    if (!originAllowed || !hostAllowed)
+    {
+        SendResponse(clientSocket, 403, "application/json", String("{\"error\":\"forbidden origin or host\"}"));
+
+        return;
+    }
+
     if (contentLength > MaxBodyBytes)
     {
         SendResponse(clientSocket, 413, "application/json", String("{\"error\":\"payload too large\"}"));
@@ -563,6 +631,13 @@ void MCPServer::HandleConnection(int clientSocket)
 
     while (body.Size() < contentLength && m_running.Load())
     {
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            SendResponse(clientSocket, 408, "application/json", String("{\"error\":\"request timed out\"}"));
+
+            return;
+        }
+
         fd_set readSet;
         FD_ZERO(&readSet);
         FD_SET(clientSocket, &readSet);

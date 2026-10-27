@@ -41,6 +41,8 @@
 #include <Core/Reflection/StaticField.hpp>
 #include <Core/Reflection/TypeInfo.hpp>
 
+#include <Core/Containers/Array.hpp>
+
 #include <Core/Math/MathUtil.hpp>
 
 #include <Framework/EngineGlobals.hpp>
@@ -162,6 +164,63 @@ JSON::Value CoerceStringifiedValue(const JSON::Value& value, const TypeInfo& typ
     }
 
     return value;
+}
+
+// Instances made by create_instance. Owns the value so it outlives the request; only touched on the sim thread.
+constexpr uint32 MaxRegisteredInstances = 256;
+
+struct RegisteredInstance
+{
+    String id;
+    BoxedValue value;
+};
+
+Array<RegisteredInstance>& GetRegisteredInstances()
+{
+    static Array<RegisteredInstance> instances;
+
+    return instances;
+}
+
+uint32 g_nextInstanceId = 1;
+
+String RegisterInstance(BoxedValue value)
+{
+    String id = HYP_FORMAT("inst-{}", g_nextInstanceId++);
+
+    GetRegisteredInstances().PushBack(RegisteredInstance { id, std::move(value) });
+
+    return id;
+}
+
+const RegisteredInstance* FindRegisteredInstance(const String& id)
+{
+    for (const RegisteredInstance& entry : GetRegisteredInstances())
+    {
+        if (entry.id == id)
+        {
+            return &entry;
+        }
+    }
+
+    return nullptr;
+}
+
+bool ReleaseRegisteredInstance(const String& id)
+{
+    Array<RegisteredInstance>& instances = GetRegisteredInstances();
+
+    for (size_t index = 0; index < instances.Size(); index++)
+    {
+        if (instances[index].id == id)
+        {
+            instances.EraseAt(index);
+
+            return true;
+        }
+    }
+
+    return false;
 }
 
 TResult<BoxedValue> ResolveTargetOnSimThread(const JSON::Value& targetJson);
@@ -384,6 +443,18 @@ TResult<BoxedValue> ResolveTargetOnSimThread(const JSON::Value& targetJson)
         }
 
         return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "No world grid layer named '{}'", layerKey));
+    }
+
+    auto instanceIt = targetObject.Find("instance");
+    if (instanceIt != targetObject.End() && instanceIt->second.IsString())
+    {
+        const RegisteredInstance* registered = FindRegisteredInstance(instanceIt->second.AsString());
+        if (registered == nullptr)
+        {
+            return TResult<BoxedValue>(HYP_MAKE_ERROR(Error, "No instance '{}' (released, or never created by create_instance)", instanceIt->second.AsString()));
+        }
+
+        return TResult<BoxedValue>(registered->value);
     }
 
     auto uuidIt = targetObject.Find("uuid");
@@ -1018,27 +1089,78 @@ TResult<JSON::Value> HandleCreateInstance(const JSON::Object& args)
         {
             BoxedValue boxed;
 
-            if (!cls->CreateInstance(boxed))
+            // plain value types are never constructed by CreateInstance (it reports success without assigning)
+            if (!cls->CreateInstance(boxed) || boxed.GetTypeInfo() == nullptr)
             {
                 JSON::Object result;
                 result.Set("ok", JSON::Value(false));
-                result.Set("error", JSON::Value(String("Failed to create instance of class ") + cls->GetName().ToString()));
+                result.Set("error", JSON::Value(String("Failed to create instance of class ") + cls->GetName().ToString() + String(" (only object types can be instantiated)")));
 
                 return JSON::Value(std::move(result));
             }
 
-            Handle<ObjectBase> instance;
+            if (GetRegisteredInstances().Size() >= MaxRegisteredInstances)
+            {
+                JSON::Object result;
+                result.Set("ok", JSON::Value(false));
+                result.Set("error", JSON::Value(String("Too many registered instances; release some with release_instance")));
+
+                return JSON::Value(std::move(result));
+            }
+
+            JSON::Value targetJson = JSON::Value(JSON::JSNull {});
 
             if (boxed.Is<Handle<ObjectBase>>())
             {
-                instance = boxed.Get<Handle<ObjectBase>>();
+                targetJson = MakeTargetJson(boxed.Get<Handle<ObjectBase>>());
             }
+
+            if (!targetJson.IsObject())
+            {
+                JSON::Object classOnly;
+                classOnly.Set("class", JSON::Value(cls->GetName().ToString()));
+                targetJson = JSON::Value(std::move(classOnly));
+            }
+
+            const String id = RegisterInstance(std::move(boxed));
+
+            JSON::Object instanceObject = targetJson.AsObject();
+            instanceObject.Set("instance", JSON::Value(id));
 
             JSON::Object resultObject;
             resultObject.Set("ok", JSON::Value(true));
-            resultObject.Set("instance", MakeTargetJson(instance));
+            resultObject.Set("instance", JSON::Value(std::move(instanceObject)));
 
             return JSON::Value(std::move(resultObject));
+        });
+}
+
+TResult<JSON::Value> HandleReleaseInstance(const JSON::Object& args)
+{
+    auto instanceIt = args.Find("instance");
+    if (instanceIt == args.End() || !instanceIt->second.IsString())
+    {
+        return TResult<JSON::Value>(HYP_MAKE_ERROR(Error, "release_instance requires a string 'instance' argument (the id from create_instance)"));
+    }
+
+    const String id = instanceIt->second.AsString();
+
+    return DispatchSimThread(
+        [id]() -> JSON::Value
+        {
+            JSON::Object result;
+
+            if (!ReleaseRegisteredInstance(id))
+            {
+                result.Set("ok", JSON::Value(false));
+                result.Set("error", JSON::Value(String("No instance '") + id + String("'")));
+
+                return JSON::Value(std::move(result));
+            }
+
+            result.Set("ok", JSON::Value(true));
+
+            return JSON::Value(std::move(result));
         });
 }
 
@@ -1808,6 +1930,11 @@ TResult<JSON::Value> HandleSetScriptField(const JSON::Object& args)
 
 } // namespace
 
+void ClearRegisteredInstances()
+{
+    GetRegisteredInstances().Clear();
+}
+
 void RegisterReflectionMCPTools(MCPRouter& router)
 {
     router.Register(MCPTool {
@@ -1872,11 +1999,21 @@ void RegisterReflectionMCPTools(MCPRouter& router)
 
     router.Register(MCPTool {
         "create_instance",
-        "Create a new instance of a reflected class (must be non-abstract with default construction). Note: the instance is standalone - if it is a Node it is NOT added to the scene, so it cannot be targeted by uuid (scene lookups only find attached nodes). To create scene content prefer clone_node (duplicate an existing node) or execute_editor_command (e.g. AddCube).",
+        "Create a new instance of a reflected object class (must be non-abstract with default construction). The instance is kept alive in a registry and returned with an 'instance' id: target it with {\"instance\": \"<id>\"} in invoke_method/get_field/set_field/get_object. It stays alive until release_instance is called (max 256). If it is a Node it is NOT added to the scene, so it cannot be targeted by uuid until attached (e.g. invoke_method AddChild on a scene node with {\"instance\": ...}). To create scene content prefer clone_node (duplicate an existing node) or execute_editor_command (e.g. AddCube).",
         MakeToolInputSchema({ { "class", MakeStringSchemaProperty("Class name") } }, { "class" }),
         [](const JSON::Object& args)
         {
             return HandleCreateInstance(args);
+        }
+    });
+
+    router.Register(MCPTool {
+        "release_instance",
+        "Release an instance created by create_instance so it can be destroyed (if nothing else, like a scene, still references it).",
+        MakeToolInputSchema({ { "instance", MakeStringSchemaProperty("Instance id returned by create_instance") } }, { "instance" }),
+        [](const JSON::Object& args)
+        {
+            return HandleReleaseInstance(args);
         }
     });
 

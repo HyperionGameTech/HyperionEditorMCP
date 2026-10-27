@@ -7,6 +7,7 @@
 #include "MCP.hpp"
 #include "MCPRouter.hpp"
 #include "MCPServer.hpp"
+#include "MCPEditorAccess.hpp"
 
 #include <Engine/Plugins/PluginAPI.hpp>
 
@@ -48,12 +49,17 @@ public:
     void OnEditorShutdown() override
     {
         MCPServer::GetInstance().Stop();
+
+        // no request can touch the registry now; release instances before the engine tears down
+        ClearRegisteredInstances();
     }
 
     void OnShutdown() override
     {
         // Defensive: make sure the bridge is not serving while the host tears down.
         MCPServer::GetInstance().Stop();
+
+        ClearRegisteredInstances();
 
         delete m_logChannelHandle;
         m_logChannelHandle = nullptr;

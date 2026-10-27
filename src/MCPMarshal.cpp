@@ -53,8 +53,15 @@ uint32 StartMCPJob(const String& name, Proc<JSON::Object()>&& fn)
         while (registry.jobs.Size() > 64)
         {
             auto it = registry.jobs.Begin();
-            while (it != registry.jobs.End() && (*it)->status == "running")
+            while (it != registry.jobs.End())
             {
+                Mutex::Guard jobGuard((*it)->mutex);
+
+                if ((*it)->status != "running")
+                {
+                    break;
+                }
+
                 ++it;
             }
 
@@ -72,17 +79,11 @@ uint32 StartMCPJob(const String& name, Proc<JSON::Object()>&& fn)
         {
             JSON::Object result = fn();
 
+            const bool hasError = result.Contains("error");
+
             Mutex::Guard guard(job->mutex);
             job->result = std::move(result);
-
-            if (result.Contains("error"))
-            {
-                job->status = "error";
-            }
-            else
-            {
-                job->status = "complete";
-            }
+            job->status = hasError ? "error" : "complete";
         },
         TaskThreadPoolName::THREAD_POOL_BACKGROUND,
         TaskEnqueueFlags::FIRE_AND_FORGET);
