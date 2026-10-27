@@ -9,92 +9,55 @@
 #include "MCPServer.hpp"
 #include "MCPEditorAccess.hpp"
 
-#include <Engine/Plugins/PluginAPI.hpp>
+#include <Engine/Plugins/PluginModule.hpp>
+#include <Engine/Plugins/PluginContext.hpp>
+
+#include <Engine/Framework/EngineGlobals.hpp>
 
 namespace Hyperion {
 namespace MCP {
 
-namespace {
-
-class MCPPlugin final : public IPlugin
+class MCPBridgeModule final : public IPluginModule
 {
 public:
-    void OnInitialize(const IPluginHost* host) override
+    void OnLoad(PluginContext& context) override
     {
-        m_host = host;
-
-        // channels defined in plugins load after the engine's LogChannelRegistrar::RegisterAll, so they never get an id
-        // and no redirect (get_logs included) can see them; register ours dynamically instead
-        if (g_logChannel_MCP.id == ~0u)
-        {
-            m_logChannelHandle = new DynamicLogChannelHandle(Logger::GetInstance().CreateDynamicLogChannel(g_logChannel_MCP));
-        }
+        // channels defined in plugins load after the engine's LogChannelRegistrar::RegisterAll, so no redirect
+        // (get_logs included) would see them; register ours dynamically instead
+        m_logChannelHandle = MakeUnique<DynamicLogChannelHandle>(Logger::GetInstance().CreateDynamicLogChannel(g_logChannel_MCP));
 
         // Touch the router so all tools register (and log) at load time
         // rather than on the first MCP request.
         MCPRouter::GetInstance();
 
-        HYP_LOG(MCP, Info, "MCP plugin initialized (engine {}.{}.{}, plugin ABI {})",
-            host->GetEngineVersionMajor(),
-            host->GetEngineVersionMinor(),
-            host->GetEngineVersionPatch(),
-            host->GetABIVersion());
-    }
+        HYP_LOG(MCP, Info, "MCP bridge loaded (engine {}.{}.{})", HYP_VERSION_MAJOR, HYP_VERSION_MINOR, HYP_VERSION_PATCH);
 
-    void OnEditorLaunch() override
-    {
+        // headless editor hosts (tests, commandlets) would otherwise compete with a running editor for the port
+        if (EngineGlobals::IsHeadless())
+        {
+            return;
+        }
+
         MCPServer::GetInstance().AutoStart();
     }
 
-    void OnEditorShutdown() override
+    void OnUnload() override
     {
         MCPServer::GetInstance().Stop();
 
         // no request can touch the registry now; release instances before the engine tears down
         ClearRegisteredInstances();
-    }
 
-    void OnShutdown() override
-    {
-        // Defensive: make sure the bridge is not serving while the host tears down.
-        MCPServer::GetInstance().Stop();
-
-        ClearRegisteredInstances();
-
-        delete m_logChannelHandle;
-        m_logChannelHandle = nullptr;
+        m_logChannelHandle.Reset();
     }
 
 private:
-    const IPluginHost* m_host = nullptr;
-    DynamicLogChannelHandle* m_logChannelHandle = nullptr;
+    UniquePtr<DynamicLogChannelHandle> m_logChannelHandle;
 };
-
-MCPPlugin s_plugin;
-
-} // namespace
 
 } // namespace MCP
 } // namespace Hyperion
 
-extern "C" HYP_PLUGIN_API Hyperion::HypPluginDescriptor* HypPluginQuery()
-{
-    static Hyperion::HypPluginDescriptor descriptor;
-    descriptor.name = "MCPBridge";
-    descriptor.version = "1.0.0";
-    descriptor.abiVersion = HYP_PLUGIN_ABI_VERSION;
-    descriptor.hostFlags = Hyperion::HypPluginHostFlags::Editor;
+HYP_DEFINE_PLUGIN_MODULE(MCPBridge, MCPBridgeEditor, ::Hyperion::MCP::MCPBridgeModule)
 
-    return &descriptor;
-}
-
-extern "C" HYP_PLUGIN_API Hyperion::IPlugin* HypPluginLoad(const Hyperion::IPluginHost* host)
-{
-    return &Hyperion::MCP::s_plugin;
-}
-
-extern "C" HYP_PLUGIN_API void HypPluginUnload(Hyperion::IPlugin* plugin)
-{
-    // The plugin instance has static storage duration inside this DLL;
-    // nothing to free here.
-}
+static const bool g_pluginModuleInitializerAdded = (::Hyperion::AddPluginModuleInitializer(&HypRegisterPluginModule_MCPBridgeEditor), true);

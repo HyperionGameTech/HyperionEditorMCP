@@ -134,7 +134,6 @@ add_library(${BUILD_NAME} SHARED ${PLUGIN_SOURCES} ${PLUGIN_HEADERS})
 # produce different layouts than hyperion.dll was built with.
 # ---------------------------------------------------------------------------
 target_compile_definitions(${BUILD_NAME} PRIVATE
-  HYP_BUILD_PLUGIN=1
   HYPERION_ENGINE=1
   HYP_TYPE_ID_COMPILE_TIME=1
   HYP_EDITOR=1
@@ -340,7 +339,7 @@ endif()
 
 # ---------------------------------------------------------------------------
 # Output: Binaries/<Platform>/<Config>/Plugins/MCPBridge/ next to the engine,
-# so the PluginManager discovers it on next editor launch.
+# as hyperion-plugin-MCPBridgeEditor (an editor module of the MCPBridge plugin), so the PluginManager finds it
 # ---------------------------------------------------------------------------
 if(NOT DEFINED HYP_PLUGIN_OUTPUT_DIR)
   set(HYP_PLUGIN_OUTPUT_DIR "${HYP_ENGINE_BIN_DIR}/Plugins/MCPBridge")
@@ -358,6 +357,7 @@ set_target_properties(${BUILD_NAME} PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY_RELEASE "${HYP_PLUGIN_OUTPUT_DIR}"
   LIBRARY_OUTPUT_DIRECTORY_DEBUG "${HYP_PLUGIN_OUTPUT_DIR}"
   PREFIX ""
+  OUTPUT_NAME "hyperion-plugin-MCPBridgeEditor"
 )
 
 add_custom_command(TARGET ${BUILD_NAME} POST_BUILD

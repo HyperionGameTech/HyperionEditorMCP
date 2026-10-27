@@ -1,6 +1,6 @@
 PluginDescriptor "MCPBridge" {
     Version = "1.0.0"
+    Description = "Lets MCP clients drive the editor over HTTP on 127.0.0.1"
+    EnabledByDefault = true
     EngineMinVersion = "0.5.0"
-    Entry = "HyperionMCP.dll"
-    Host = Editor
 }
